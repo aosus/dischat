@@ -17,11 +17,11 @@ async def route_event(
     chat_accounts: ChatAccountRepository,
     delivery_jobs: DeliveryJobRepository,
 ) -> None:
-    if category_slug is not None and discourse_event.event_type == 'new_topic':
+    if category_slug is not None and discourse_event.event_type == "new_topic":
         for room_link in await room_links.list_links_matching_category(category_slug):
             await delivery_jobs.enqueue(
                 event_id=event_id,
-                target_type='room',
+                target_type="room",
                 target_mxid=None,
                 matrix_room_id=room_link.matrix_room_id,
             )
@@ -31,7 +31,7 @@ async def route_event(
         ):
             await delivery_jobs.enqueue(
                 event_id=event_id,
-                target_type='dm',
+                target_type="dm",
                 target_mxid=account.mxid,
                 matrix_room_id=None,
             )

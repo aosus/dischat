@@ -31,10 +31,10 @@ async def poll_once(
     delivery_jobs: DeliveryJobRepository,
 ) -> int:
     posts = await client.list_latest_posts(before=None)
-    posts = sorted(posts, key=lambda item: int(item['id']))
+    posts = sorted(posts, key=lambda item: int(item["id"]))
     processed = 0
     for post_payload in posts:
-        post_id = int(post_payload['id'])
+        post_id = int(post_payload["id"])
         if state.last_seen_post_id is not None and post_id <= state.last_seen_post_id:
             continue
         discourse_event: DiscourseEvent = normalize_post_event(post_payload)

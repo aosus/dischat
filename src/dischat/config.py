@@ -32,8 +32,8 @@ class Settings(BaseSettings):
     matrix_homeserver_url: str = Field(default="", alias="MATRIX_HOMESERVER_URL")
     matrix_access_token: str | None = Field(default=None, alias="MATRIX_ACCESS_TOKEN")
     matrix_bot_mxid: str = Field(default="", alias="MATRIX_BOT_MXID")
-    matrix_bot_username: str | None = Field(default=None, alias='MATRIX_BOT_USERNAME')
-    matrix_bot_password: str | None = Field(default=None, alias='MATRIX_BOT_PASSWORD')
+    matrix_bot_username: str | None = Field(default=None, alias="MATRIX_BOT_USERNAME")
+    matrix_bot_password: str | None = Field(default=None, alias="MATRIX_BOT_PASSWORD")
     discourse_base_url: str = Field(default="", alias="DISCOURSE_BASE_URL")
     discourse_api_key: str = Field(default="", alias="DISCOURSE_API_KEY")
     discourse_system_username: str = Field(default="", alias="DISCOURSE_SYSTEM_USERNAME")
@@ -74,10 +74,14 @@ class Settings(BaseSettings):
             raise ValueError(f"Missing required environment variables: {joined}")
         if not self.matrix_bot_mxid:
             if not self.matrix_bot_username:
-                raise ValueError('Missing required environment variable: MATRIX_BOT_MXID or MATRIX_BOT_USERNAME')
+                raise ValueError(
+                    "Missing required environment variable: MATRIX_BOT_MXID or MATRIX_BOT_USERNAME"
+                )
             self.matrix_bot_mxid = self.matrix_bot_username
         if self.matrix_access_token is None and not self.matrix_bot_password:
-            raise ValueError('Missing Matrix authentication: MATRIX_ACCESS_TOKEN or MATRIX_BOT_PASSWORD')
+            raise ValueError(
+                "Missing Matrix authentication: MATRIX_ACCESS_TOKEN or MATRIX_BOT_PASSWORD"
+            )
 
 
 def load_settings() -> Settings:

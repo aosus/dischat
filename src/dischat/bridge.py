@@ -29,7 +29,9 @@ class DiscourseReplyWriter(Protocol):
 
 
 class ChatAccountsRepo(Protocol):
-    async def ensure_account(self, *, mxid: str, platform: str, response_locale: str) -> ChatAccount: ...
+    async def ensure_account(
+        self, *, mxid: str, platform: str, response_locale: str
+    ) -> ChatAccount: ...
 
 
 class RoomLinksRepo(Protocol):
@@ -50,9 +52,9 @@ class AuditLogsRepo(Protocol):
 
 
 def relay_username_for_platform(*, platform: str, matrix: str, telegram: str, discord: str) -> str:
-    if platform == 'telegram':
+    if platform == "telegram":
         return telegram
-    if platform == 'discord':
+    if platform == "discord":
         return discord
     return matrix
 
@@ -83,7 +85,7 @@ async def handle_matrix_reply(
     account = await chat_accounts.ensure_account(
         mxid=message.sender,
         platform=detect_platform(message.sender),
-        response_locale='ar',
+        response_locale="ar",
     )
     room_link = await room_links.get_by_room_id(message.room_id)
     permission = can_post_from_chat(
@@ -93,17 +95,17 @@ async def handle_matrix_reply(
         room_allows_relay=room_link.allow_relay if room_link is not None else False,
     )
 
-    if permission.decision == 'reject':
+    if permission.decision == "reject":
         response = await matrix_client.send_notice(
             message.room_id,
-            translate('posting.requires_pairing', account.response_locale),
+            translate("posting.requires_pairing", account.response_locale),
         )
         return BridgeResult(posted=False, error_message=permission.reason, matrix_response=response)
-    if permission.decision == 'ignore':
+    if permission.decision == "ignore":
         return BridgeResult(posted=False)
 
     discourse_username = account.discourse_username
-    if permission.decision == 'relay':
+    if permission.decision == "relay":
         discourse_username = relay_username_for_platform(
             platform=account.platform,
             matrix=relay_matrix_username,
@@ -118,7 +120,7 @@ async def handle_matrix_reply(
     )
     await audit_logs.record(
         AuditEntry(
-            action='create_discourse_reply',
+            action="create_discourse_reply",
             mxid=message.sender,
             platform=account.platform,
             discourse_username_used=discourse_username,

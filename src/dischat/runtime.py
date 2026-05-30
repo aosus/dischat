@@ -42,7 +42,7 @@ class AppContext:
 
 async def build_context(settings: Settings) -> AppContext:
     pool = await create_pool(settings.database_url)
-    await apply_sql_migrations(pool, Path(__file__).resolve().parent / 'storage' / 'migrations')
+    await apply_sql_migrations(pool, Path(__file__).resolve().parent / "storage" / "migrations")
     file_config = settings.load_file_config()
     discourse_client = DiscourseClient(
         base_url=settings.discourse_base_url,

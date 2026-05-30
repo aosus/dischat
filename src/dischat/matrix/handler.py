@@ -28,14 +28,17 @@ async def process_sync_messages(
             mxid=message.sender,
             platform=detect_platform(message.sender),
             body=message.body,
-            locale='ar',
+            locale="ar",
             live_e2e_category_id=live_e2e_category_id,
         )
         if command_response is not None:
-            if command_response.pairing_code_to_deliver and command_response.pairing_target_username:
+            if (
+                command_response.pairing_code_to_deliver
+                and command_response.pairing_target_username
+            ):
                 await discourse_client.create_private_message(
                     target_username=command_response.pairing_target_username,
-                    title='Dischat pairing code',
+                    title="Dischat pairing code",
                     raw=command_response.pairing_code_to_deliver,
                 )
             await matrix_client.send_notice(message.room_id, command_response.body)

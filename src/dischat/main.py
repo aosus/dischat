@@ -20,7 +20,7 @@ async def run() -> None:
     settings = load_settings()
     settings.validate_runtime_requirements()
     logger = logging.getLogger(__name__)
-    logger.info('Dischat service configuration loaded from %s', settings.config_file)
+    logger.info("Dischat service configuration loaded from %s", settings.config_file)
     context = await build_context(settings)
     await context.matrix_client.login()
 
@@ -63,7 +63,7 @@ async def run() -> None:
         chat_accounts=context.chat_accounts,
         delivery_jobs=context.delivery_jobs,
     )
-    logger.info('Processed %s Discourse events', processed)
+    logger.info("Processed %s Discourse events", processed)
 
     while True:
         job = await context.delivery_jobs.claim_next_job()
@@ -81,7 +81,7 @@ async def run() -> None:
         else:
             await context.delivery_jobs.mark_failed(
                 job.id,
-                error=result.error or 'unknown_error',
+                error=result.error or "unknown_error",
                 next_attempt_at=backoff_delay(job.attempts),
             )
 

@@ -12,7 +12,9 @@ class FakeChatAccounts:
     def __init__(self) -> None:
         self.accounts: dict[str, ChatAccount] = {}
 
-    async def ensure_account(self, *, mxid: str, platform: str, response_locale: str) -> ChatAccount:
+    async def ensure_account(
+        self, *, mxid: str, platform: str, response_locale: str
+    ) -> ChatAccount:
         account = self.accounts.get(mxid)
         if account is None:
             account = ChatAccount(
@@ -148,8 +150,8 @@ class FakePairingSessions:
 class FakeCategories:
     def __init__(self) -> None:
         self.by_slug: dict[str, CategoryRecord] = {
-            'support': CategoryRecord(1, 10, 'support', 'Support', True, True),
-            'dischat-test': CategoryRecord(2, 56, 'dischat-test', 'Dischat Test', False, True),
+            "support": CategoryRecord(1, 10, "support", "Support", True, True),
+            "dischat-test": CategoryRecord(2, 56, "dischat-test", "Dischat Test", False, True),
         }
 
     async def list_categories(self) -> list[CategoryRecord]:
@@ -165,23 +167,31 @@ class FakeUserWatches:
         self._next_id = 1
 
     async def add_category_watch(self, *, mxid: str, category_id: int) -> UserWatchRecord:
-        category_slug = 'support' if category_id == 1 else 'dischat-test'
-        record = UserWatchRecord(self._next_id, mxid, 'category', category_id, category_slug)
+        category_slug = "support" if category_id == 1 else "dischat-test"
+        record = UserWatchRecord(self._next_id, mxid, "category", category_id, category_slug)
         self._next_id += 1
         self.records.append(record)
         return record
 
     async def add_watch_all(self, *, mxid: str) -> UserWatchRecord:
-        record = UserWatchRecord(self._next_id, mxid, 'all_public_categories', None, None)
+        record = UserWatchRecord(self._next_id, mxid, "all_public_categories", None, None)
         self._next_id += 1
         self.records.append(record)
         return record
 
     async def remove_category_watch(self, *, mxid: str, category_id: int) -> None:
-        self.records = [record for record in self.records if not (record.mxid == mxid and record.category_id == category_id)]
+        self.records = [
+            record
+            for record in self.records
+            if not (record.mxid == mxid and record.category_id == category_id)
+        ]
 
     async def remove_watch_all(self, *, mxid: str) -> None:
-        self.records = [record for record in self.records if not (record.mxid == mxid and record.mode == 'all_public_categories')]
+        self.records = [
+            record
+            for record in self.records
+            if not (record.mxid == mxid and record.mode == "all_public_categories")
+        ]
 
     async def list_watches_for_mxid(self, mxid: str) -> list[UserWatchRecord]:
         return [record for record in self.records if record.mxid == mxid]
@@ -201,65 +211,65 @@ async def test_mocked_e2e_pair_watch_and_unwatch_flow() -> None:
     service = build_service()
 
     start = await service.handle_message(
-        mxid='@alice:aosus.org',
-        platform='matrix',
-        body='/pair test',
-        locale='en',
+        mxid="@alice:aosus.org",
+        platform="matrix",
+        body="/pair test",
+        locale="en",
     )
     assert start is not None and start.pairing_code_to_deliver is not None
 
     paired = await service.handle_message(
-        mxid='@alice:aosus.org',
-        platform='matrix',
+        mxid="@alice:aosus.org",
+        platform="matrix",
         body=start.pairing_code_to_deliver,
-        locale='en',
+        locale="en",
     )
     assert paired is not None
-    assert paired.body == 'Pairing complete.'
+    assert paired.body == "Pairing complete."
 
     watched = await service.handle_message(
-        mxid='@alice:aosus.org',
-        platform='matrix',
-        body='/watch category support',
-        locale='en',
+        mxid="@alice:aosus.org",
+        platform="matrix",
+        body="/watch category support",
+        locale="en",
     )
     assert watched is not None
-    assert watched.body == 'Now watching category support.'
+    assert watched.body == "Now watching category support."
 
     watches = await service.handle_message(
-        mxid='@alice:aosus.org',
-        platform='matrix',
-        body='/watches',
-        locale='en',
+        mxid="@alice:aosus.org",
+        platform="matrix",
+        body="/watches",
+        locale="en",
     )
     assert watches is not None
-    assert watches.body == 'Current watches: support'
+    assert watches.body == "Current watches: support"
 
     unwatched = await service.handle_message(
-        mxid='@alice:aosus.org',
-        platform='matrix',
-        body='/unwatch category support',
-        locale='en',
+        mxid="@alice:aosus.org",
+        platform="matrix",
+        body="/unwatch category support",
+        locale="en",
     )
     assert unwatched is not None
-    assert unwatched.body == 'Stopped watching category support.'
+    assert unwatched.body == "Stopped watching category support."
 
 
 async def test_mocked_e2e_arabic_pairing_prompt() -> None:
     service = build_service()
 
     await service.handle_message(
-        mxid='@alice:aosus.org',
-        platform='matrix',
-        body='/pair test',
-        locale='ar',
+        mxid="@alice:aosus.org",
+        platform="matrix",
+        body="/pair test",
+        locale="ar",
     )
     result = await service.handle_message(
-        mxid='@alice:aosus.org',
-        platform='matrix',
-        body='abc123',
-        locale='ar',
+        mxid="@alice:aosus.org",
+        platform="matrix",
+        body="abc123",
+        locale="ar",
     )
 
     assert result is not None
-    assert 'أرسل رمز الربط' in result.body
+    assert "أرسل رمز الربط" in result.body

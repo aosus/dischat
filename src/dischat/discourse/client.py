@@ -57,7 +57,7 @@ class DiscourseClient:
             post_id=payload["id"],
             topic_id=payload["topic_id"],
             raw=payload["raw"],
-            post_number=payload.get('post_number'),
+            post_number=payload.get("post_number"),
         )
 
     async def create_reply(
@@ -73,7 +73,7 @@ class DiscourseClient:
             post_id=payload["id"],
             topic_id=payload["topic_id"],
             raw=payload["raw"],
-            post_number=payload.get('post_number'),
+            post_number=payload.get("post_number"),
         )
 
     async def list_latest_posts(self, *, before: int | None = None) -> list[dict[str, Any]]:
@@ -89,7 +89,7 @@ class DiscourseClient:
         return dict(response.json())
 
     async def get_post(self, post_id: int) -> dict[str, Any]:
-        response = await self._client.get(f'/posts/{post_id}.json', headers=self.headers)
+        response = await self._client.get(f"/posts/{post_id}.json", headers=self.headers)
         response.raise_for_status()
         return dict(response.json())
 

@@ -9,9 +9,9 @@ import asyncpg
 
 from dischat.security.audit import AuditEntry
 
-WatchMode = Literal['category', 'all_public_categories']
-JobStatus = Literal['pending', 'running', 'complete', 'failed']
-TargetType = Literal['dm', 'room']
+WatchMode = Literal["category", "all_public_categories"]
+JobStatus = Literal["pending", "running", "complete", "failed"]
+TargetType = Literal["dm", "room"]
 
 
 @dataclass(slots=True, frozen=True)
@@ -109,16 +109,80 @@ class DeliveryMessageRecord:
 
 def _record_to_chat_account(row: asyncpg.Record) -> ChatAccount:
     return ChatAccount(
-        id=row['id'],
-        mxid=row['mxid'],
-        platform=row['platform'],
-        discourse_user_id=row['discourse_user_id'],
-        discourse_username=row['discourse_username'],
-        paired_at=row['paired_at'],
-        revoked_at=row['revoked_at'],
-        notify_on_direct_replies=row['notify_on_direct_replies'],
-        notify_on_mentions=row['notify_on_mentions'],
-        response_locale=row['response_locale'],
+        id=row["id"],
+        mxid=row["mxid"],
+        platform=row["platform"],
+        discourse_user_id=row["discourse_user_id"],
+        discourse_username=row["discourse_username"],
+        paired_at=row["paired_at"],
+        revoked_at=row["revoked_at"],
+        notify_on_direct_replies=row["notify_on_direct_replies"],
+        notify_on_mentions=row["notify_on_mentions"],
+        response_locale=row["response_locale"],
+    )
+
+
+def _record_to_pairing_session(row: asyncpg.Record) -> PairingSessionRecord:
+    return PairingSessionRecord(
+        id=row["id"],
+        mxid=row["mxid"],
+        discourse_username=row["discourse_username"],
+        discourse_user_id=row["discourse_user_id"],
+        code_hash=row["code_hash"],
+        expires_at=row["expires_at"],
+        consumed_at=row["consumed_at"],
+        attempt_count=row["attempt_count"],
+    )
+
+
+def _record_to_category(row: asyncpg.Record) -> CategoryRecord:
+    return CategoryRecord(
+        id=row["id"],
+        discourse_category_id=row["discourse_category_id"],
+        slug=row["slug"],
+        name=row["name"],
+        is_public=row["is_public"],
+        enabled=row["enabled"],
+    )
+
+
+def _record_to_discourse_event(row: asyncpg.Record) -> DiscourseEventRecord:
+    return DiscourseEventRecord(
+        id=row["id"],
+        discourse_topic_id=row["discourse_topic_id"],
+        discourse_post_id=row["discourse_post_id"],
+        event_type=row["event_type"],
+        category_id=row["category_id"],
+        author_username=row["author_username"],
+        target_discourse_username=row["target_discourse_username"],
+        raw_payload_json=row["raw_payload_json"],
+    )
+
+
+def _record_to_delivery_job(row: asyncpg.Record) -> DeliveryJobRecord:
+    return DeliveryJobRecord(
+        id=row["id"],
+        event_id=row["event_id"],
+        target_type=row["target_type"],
+        target_mxid=row["target_mxid"],
+        matrix_room_id=row["matrix_room_id"],
+        status=row["status"],
+        attempts=row["attempts"],
+        next_attempt_at=row["next_attempt_at"],
+        last_error=row["last_error"],
+    )
+
+
+def _record_to_delivery_message(row: asyncpg.Record) -> DeliveryMessageRecord:
+    return DeliveryMessageRecord(
+        id=row["id"],
+        discourse_topic_id=row["discourse_topic_id"],
+        discourse_post_id=row["discourse_post_id"],
+        matrix_room_id=row["matrix_room_id"],
+        matrix_event_id=row["matrix_event_id"],
+        target_type=row["target_type"],
+        target_mxid=row["target_mxid"],
+        parent_delivery_message_id=row["parent_delivery_message_id"],
     )
 
 
@@ -126,16 +190,18 @@ class ChatAccountRepository:
     def __init__(self, pool: asyncpg.Pool) -> None:
         self._pool = pool
 
-    async def ensure_account(self, *, mxid: str, platform: str, response_locale: str) -> ChatAccount:
+    async def ensure_account(
+        self, *, mxid: str, platform: str, response_locale: str
+    ) -> ChatAccount:
         async with self._pool.acquire() as connection:
             row = await connection.fetchrow(
-                '''
+                """
                 INSERT INTO chat_accounts (mxid, platform, response_locale, created_at, updated_at)
                 VALUES ($1, $2, $3, NOW(), NOW())
                 ON CONFLICT (mxid)
                 DO UPDATE SET platform = EXCLUDED.platform, response_locale = EXCLUDED.response_locale, updated_at = NOW()
                 RETURNING *
-                ''',
+                """,
                 mxid,
                 platform,
                 response_locale,
@@ -145,7 +211,7 @@ class ChatAccountRepository:
 
     async def get_by_mxid(self, mxid: str) -> ChatAccount | None:
         async with self._pool.acquire() as connection:
-            row = await connection.fetchrow('SELECT * FROM chat_accounts WHERE mxid = $1', mxid)
+            row = await connection.fetchrow("SELECT * FROM chat_accounts WHERE mxid = $1", mxid)
         return _record_to_chat_account(row) if row is not None else None
 
     async def pair_account(
@@ -157,7 +223,7 @@ class ChatAccountRepository:
     ) -> ChatAccount:
         async with self._pool.acquire() as connection:
             row = await connection.fetchrow(
-                '''
+                """
                 UPDATE chat_accounts
                 SET discourse_username = $2,
                     discourse_user_id = $3,
@@ -166,7 +232,7 @@ class ChatAccountRepository:
                     updated_at = NOW()
                 WHERE mxid = $1
                 RETURNING *
-                ''',
+                """,
                 mxid,
                 discourse_username,
                 discourse_user_id,
@@ -177,7 +243,7 @@ class ChatAccountRepository:
     async def unpair_account(self, *, mxid: str) -> ChatAccount | None:
         async with self._pool.acquire() as connection:
             row = await connection.fetchrow(
-                '''
+                """
                 UPDATE chat_accounts
                 SET discourse_username = NULL,
                     discourse_user_id = NULL,
@@ -185,7 +251,7 @@ class ChatAccountRepository:
                     updated_at = NOW()
                 WHERE mxid = $1
                 RETURNING *
-                ''',
+                """,
                 mxid,
             )
         return _record_to_chat_account(row) if row is not None else None
@@ -193,11 +259,11 @@ class ChatAccountRepository:
     async def list_by_discourse_username(self, discourse_username: str) -> list[ChatAccount]:
         async with self._pool.acquire() as connection:
             rows = await connection.fetch(
-                '''
+                """
                 SELECT * FROM chat_accounts
                 WHERE discourse_username = $1 AND revoked_at IS NULL
                 ORDER BY id
-                ''',
+                """,
                 discourse_username,
             )
         return [_record_to_chat_account(row) for row in rows]
@@ -218,9 +284,11 @@ class PairingSessionRepository:
     ) -> PairingSessionRecord:
         async with self._pool.acquire() as connection:
             async with connection.transaction():
-                await connection.execute('DELETE FROM pairing_sessions WHERE mxid = $1 AND consumed_at IS NULL', mxid)
+                await connection.execute(
+                    "DELETE FROM pairing_sessions WHERE mxid = $1 AND consumed_at IS NULL", mxid
+                )
                 row = await connection.fetchrow(
-                    '''
+                    """
                     INSERT INTO pairing_sessions (
                         mxid,
                         discourse_username,
@@ -231,7 +299,7 @@ class PairingSessionRepository:
                     )
                     VALUES ($1, $2, $3, $4, $5, NOW())
                     RETURNING *
-                    ''',
+                    """,
                     mxid,
                     discourse_username,
                     discourse_user_id,
@@ -239,57 +307,57 @@ class PairingSessionRepository:
                     expires_at,
                 )
         assert row is not None
-        return PairingSessionRecord(**dict(row))
+        return _record_to_pairing_session(row)
 
     async def get_active_session(self, mxid: str) -> PairingSessionRecord | None:
         async with self._pool.acquire() as connection:
             row = await connection.fetchrow(
-                '''
+                """
                 SELECT * FROM pairing_sessions
                 WHERE mxid = $1 AND consumed_at IS NULL
                 ORDER BY created_at DESC
                 LIMIT 1
-                ''',
+                """,
                 mxid,
             )
-        return PairingSessionRecord(**dict(row)) if row is not None else None
+        return _record_to_pairing_session(row) if row is not None else None
 
     async def increment_attempt_count(self, session_id: int) -> PairingSessionRecord:
         async with self._pool.acquire() as connection:
             row = await connection.fetchrow(
-                '''
+                """
                 UPDATE pairing_sessions
                 SET attempt_count = attempt_count + 1
                 WHERE id = $1
                 RETURNING *
-                ''',
+                """,
                 session_id,
             )
         assert row is not None
-        return PairingSessionRecord(**dict(row))
+        return _record_to_pairing_session(row)
 
     async def consume_session(self, session_id: int) -> PairingSessionRecord:
         async with self._pool.acquire() as connection:
             row = await connection.fetchrow(
-                '''
+                """
                 UPDATE pairing_sessions
                 SET consumed_at = NOW()
                 WHERE id = $1
                 RETURNING *
-                ''',
+                """,
                 session_id,
             )
         assert row is not None
-        return PairingSessionRecord(**dict(row))
+        return _record_to_pairing_session(row)
 
     async def cancel_session(self, mxid: str) -> None:
         async with self._pool.acquire() as connection:
             await connection.execute(
-                '''
+                """
                 UPDATE pairing_sessions
                 SET consumed_at = NOW()
                 WHERE mxid = $1 AND consumed_at IS NULL
-                ''',
+                """,
                 mxid,
             )
 
@@ -309,7 +377,7 @@ class CategoryRepository:
     ) -> CategoryRecord:
         async with self._pool.acquire() as connection:
             row = await connection.fetchrow(
-                '''
+                """
                 INSERT INTO categories (discourse_category_id, slug, name, is_public, enabled, updated_at)
                 VALUES ($1, $2, $3, $4, $5, NOW())
                 ON CONFLICT (discourse_category_id)
@@ -319,7 +387,7 @@ class CategoryRepository:
                               enabled = EXCLUDED.enabled,
                               updated_at = NOW()
                 RETURNING *
-                ''',
+                """,
                 discourse_category_id,
                 slug,
                 name,
@@ -327,24 +395,30 @@ class CategoryRepository:
                 enabled,
             )
         assert row is not None
-        return CategoryRecord(**dict(row))
+        return _record_to_category(row)
 
     async def list_categories(self) -> list[CategoryRecord]:
         async with self._pool.acquire() as connection:
-            rows = await connection.fetch('SELECT * FROM categories WHERE enabled = TRUE ORDER BY slug')
-        return [CategoryRecord(**dict(row)) for row in rows]
+            rows = await connection.fetch(
+                "SELECT * FROM categories WHERE enabled = TRUE ORDER BY slug"
+            )
+        return [_record_to_category(row) for row in rows]
 
     async def get_by_slug(self, slug: str) -> CategoryRecord | None:
         async with self._pool.acquire() as connection:
-            row = await connection.fetchrow('SELECT * FROM categories WHERE slug = $1 AND enabled = TRUE', slug)
-        return CategoryRecord(**dict(row)) if row is not None else None
+            row = await connection.fetchrow(
+                "SELECT * FROM categories WHERE slug = $1 AND enabled = TRUE", slug
+            )
+        return _record_to_category(row) if row is not None else None
 
-    async def get_by_discourse_category_id(self, discourse_category_id: int) -> CategoryRecord | None:
+    async def get_by_discourse_category_id(
+        self, discourse_category_id: int
+    ) -> CategoryRecord | None:
         async with self._pool.acquire() as connection:
             row = await connection.fetchrow(
-                'SELECT * FROM categories WHERE discourse_category_id = $1', discourse_category_id
+                "SELECT * FROM categories WHERE discourse_category_id = $1", discourse_category_id
             )
-        return CategoryRecord(**dict(row)) if row is not None else None
+        return _record_to_category(row) if row is not None else None
 
 
 class UserWatchRepository:
@@ -354,23 +428,23 @@ class UserWatchRepository:
     async def add_category_watch(self, *, mxid: str, category_id: int) -> UserWatchRecord:
         async with self._pool.acquire() as connection:
             row = await connection.fetchrow(
-                '''
+                """
                 INSERT INTO user_watches (mxid, mode, category_id, created_at)
                 VALUES ($1, 'category', $2, NOW())
                 ON CONFLICT DO NOTHING
                 RETURNING id, mxid, mode, category_id, NULL::TEXT AS category_slug
-                ''',
+                """,
                 mxid,
                 category_id,
             )
             if row is None:
                 row = await connection.fetchrow(
-                    '''
+                    """
                     SELECT uw.id, uw.mxid, uw.mode, uw.category_id, c.slug AS category_slug
                     FROM user_watches uw
                     LEFT JOIN categories c ON c.id = uw.category_id
                     WHERE uw.mxid = $1 AND uw.mode = 'category' AND uw.category_id = $2
-                    ''',
+                    """,
                     mxid,
                     category_id,
                 )
@@ -380,18 +454,18 @@ class UserWatchRepository:
     async def add_watch_all(self, *, mxid: str) -> UserWatchRecord:
         async with self._pool.acquire() as connection:
             await connection.execute(
-                '''
+                """
                 DELETE FROM user_watches
                 WHERE mxid = $1 AND mode = 'all_public_categories' AND category_id IS NULL
-                ''',
+                """,
                 mxid,
             )
             row = await connection.fetchrow(
-                '''
+                """
                 INSERT INTO user_watches (mxid, mode, category_id, created_at)
                 VALUES ($1, 'all_public_categories', NULL, NOW())
                 RETURNING id, mxid, mode, category_id, NULL::TEXT AS category_slug
-                ''',
+                """,
                 mxid,
             )
         assert row is not None
@@ -400,10 +474,10 @@ class UserWatchRepository:
     async def remove_category_watch(self, *, mxid: str, category_id: int) -> None:
         async with self._pool.acquire() as connection:
             await connection.execute(
-                '''
+                """
                 DELETE FROM user_watches
                 WHERE mxid = $1 AND mode = 'category' AND category_id = $2
-                ''',
+                """,
                 mxid,
                 category_id,
             )
@@ -411,23 +485,23 @@ class UserWatchRepository:
     async def remove_watch_all(self, *, mxid: str) -> None:
         async with self._pool.acquire() as connection:
             await connection.execute(
-                '''
+                """
                 DELETE FROM user_watches
                 WHERE mxid = $1 AND mode = 'all_public_categories' AND category_id IS NULL
-                ''',
+                """,
                 mxid,
             )
 
     async def list_watches_for_mxid(self, mxid: str) -> list[UserWatchRecord]:
         async with self._pool.acquire() as connection:
             rows = await connection.fetch(
-                '''
+                """
                 SELECT uw.id, uw.mxid, uw.mode, uw.category_id, c.slug AS category_slug
                 FROM user_watches uw
                 LEFT JOIN categories c ON c.id = uw.category_id
                 WHERE uw.mxid = $1
                 ORDER BY uw.mode, c.slug NULLS FIRST
-                ''',
+                """,
                 mxid,
             )
         return [UserWatchRecord(**dict(row)) for row in rows]
@@ -437,16 +511,18 @@ class RoomLinkRepository:
     def __init__(self, pool: asyncpg.Pool) -> None:
         self._pool = pool
 
-    async def replace_room_links(self, room_links: dict[str, dict[str, Any]], category_lookup: dict[str, int]) -> None:
+    async def replace_room_links(
+        self, room_links: dict[str, dict[str, Any]], category_lookup: dict[str, int]
+    ) -> None:
         async with self._pool.acquire() as connection:
             async with connection.transaction():
-                await connection.execute('DELETE FROM room_link_categories')
-                await connection.execute('DELETE FROM room_links')
+                await connection.execute("DELETE FROM room_link_categories")
+                await connection.execute("DELETE FROM room_links")
                 for room_id, config in room_links.items():
-                    categories = list(config.get('categories', []))
-                    include_all = 'all' in categories
+                    categories = list(config.get("categories", []))
+                    include_all = "all" in categories
                     row = await connection.fetchrow(
-                        '''
+                        """
                         INSERT INTO room_links (
                             matrix_room_id,
                             include_all_public_categories,
@@ -458,26 +534,26 @@ class RoomLinkRepository:
                         )
                         VALUES ($1, $2, $3, $4, TRUE, NOW(), NOW())
                         RETURNING id
-                        ''',
+                        """,
                         room_id,
                         include_all,
-                        bool(config.get('allow_relay', False)),
-                        bool(config.get('full_content', False)),
+                        bool(config.get("allow_relay", False)),
+                        bool(config.get("full_content", False)),
                     )
                     assert row is not None
-                    room_link_id = row['id']
+                    room_link_id = row["id"]
                     for slug in categories:
-                        if slug == 'all':
+                        if slug == "all":
                             continue
                         category_id = category_lookup.get(slug)
                         if category_id is None:
                             continue
                         await connection.execute(
-                            '''
+                            """
                             INSERT INTO room_link_categories (room_link_id, category_id)
                             VALUES ($1, $2)
                             ON CONFLICT DO NOTHING
-                            ''',
+                            """,
                             room_link_id,
                             category_id,
                         )
@@ -485,7 +561,7 @@ class RoomLinkRepository:
     async def get_by_room_id(self, matrix_room_id: str) -> RoomLinkRecord | None:
         async with self._pool.acquire() as connection:
             rows = await connection.fetch(
-                '''
+                """
                 SELECT rl.id,
                        rl.matrix_room_id,
                        rl.include_all_public_categories,
@@ -498,26 +574,28 @@ class RoomLinkRepository:
                 LEFT JOIN categories c ON c.id = rlc.category_id
                 WHERE rl.matrix_room_id = $1 AND rl.enabled = TRUE
                 ORDER BY c.slug
-                ''',
+                """,
                 matrix_room_id,
             )
         if not rows:
             return None
         first = rows[0]
         return RoomLinkRecord(
-            id=first['id'],
-            matrix_room_id=first['matrix_room_id'],
-            include_all_public_categories=first['include_all_public_categories'],
-            allow_relay=first['allow_relay'],
-            full_content=first['full_content'],
-            enabled=first['enabled'],
-            category_slugs=tuple(row['category_slug'] for row in rows if row['category_slug'] is not None),
+            id=first["id"],
+            matrix_room_id=first["matrix_room_id"],
+            include_all_public_categories=first["include_all_public_categories"],
+            allow_relay=first["allow_relay"],
+            full_content=first["full_content"],
+            enabled=first["enabled"],
+            category_slugs=tuple(
+                row["category_slug"] for row in rows if row["category_slug"] is not None
+            ),
         )
 
     async def list_links_matching_category(self, category_slug: str) -> list[RoomLinkRecord]:
         async with self._pool.acquire() as connection:
             rows = await connection.fetch(
-                '''
+                """
                 SELECT rl.id,
                        rl.matrix_room_id,
                        rl.include_all_public_categories,
@@ -531,26 +609,26 @@ class RoomLinkRepository:
                 WHERE rl.enabled = TRUE
                   AND (rl.include_all_public_categories = TRUE OR c.slug = $1)
                 ORDER BY rl.id, c.slug
-                ''',
+                """,
                 category_slug,
             )
         grouped: dict[int, RoomLinkRecord] = {}
         category_map: dict[int, list[str]] = {}
         for row in rows:
-            room_id = row['id']
+            room_id = row["id"]
             if room_id not in grouped:
                 grouped[room_id] = RoomLinkRecord(
-                    id=row['id'],
-                    matrix_room_id=row['matrix_room_id'],
-                    include_all_public_categories=row['include_all_public_categories'],
-                    allow_relay=row['allow_relay'],
-                    full_content=row['full_content'],
-                    enabled=row['enabled'],
+                    id=row["id"],
+                    matrix_room_id=row["matrix_room_id"],
+                    include_all_public_categories=row["include_all_public_categories"],
+                    allow_relay=row["allow_relay"],
+                    full_content=row["full_content"],
+                    enabled=row["enabled"],
                     category_slugs=(),
                 )
                 category_map[room_id] = []
-            if row['category_slug'] is not None:
-                category_map[room_id].append(row['category_slug'])
+            if row["category_slug"] is not None:
+                category_map[room_id].append(row["category_slug"])
         return [
             RoomLinkRecord(
                 id=record.id,
@@ -582,7 +660,7 @@ class DiscourseEventRepository:
     ) -> DiscourseEventRecord:
         async with self._pool.acquire() as connection:
             row = await connection.fetchrow(
-                '''
+                """
                 INSERT INTO discourse_events (
                     discourse_topic_id,
                     discourse_post_id,
@@ -601,7 +679,7 @@ class DiscourseEventRepository:
                               target_discourse_username = EXCLUDED.target_discourse_username,
                               raw_payload_json = EXCLUDED.raw_payload_json
                 RETURNING *
-                ''',
+                """,
                 discourse_topic_id,
                 discourse_post_id,
                 event_type,
@@ -611,19 +689,21 @@ class DiscourseEventRepository:
                 json.dumps(raw_payload_json),
             )
         assert row is not None
-        return DiscourseEventRecord(**dict(row))
+        return _record_to_discourse_event(row)
 
     async def get_by_discourse_post_id(self, discourse_post_id: int) -> DiscourseEventRecord | None:
         async with self._pool.acquire() as connection:
             row = await connection.fetchrow(
-                'SELECT * FROM discourse_events WHERE discourse_post_id = $1', discourse_post_id
+                "SELECT * FROM discourse_events WHERE discourse_post_id = $1", discourse_post_id
             )
-        return DiscourseEventRecord(**dict(row)) if row is not None else None
+        return _record_to_discourse_event(row) if row is not None else None
 
     async def get_by_id(self, event_id: int) -> DiscourseEventRecord | None:
         async with self._pool.acquire() as connection:
-            row = await connection.fetchrow('SELECT * FROM discourse_events WHERE id = $1', event_id)
-        return DiscourseEventRecord(**dict(row)) if row is not None else None
+            row = await connection.fetchrow(
+                "SELECT * FROM discourse_events WHERE id = $1", event_id
+            )
+        return _record_to_discourse_event(row) if row is not None else None
 
 
 class DeliveryJobRepository:
@@ -640,7 +720,7 @@ class DeliveryJobRepository:
     ) -> DeliveryJobRecord:
         async with self._pool.acquire() as connection:
             row = await connection.fetchrow(
-                '''
+                """
                 INSERT INTO delivery_jobs (
                     event_id,
                     target_type,
@@ -655,7 +735,7 @@ class DeliveryJobRepository:
                 VALUES ($1, $2, $3, $4, 'pending', 0, NOW(), NOW(), NOW())
                 ON CONFLICT DO NOTHING
                 RETURNING *
-                ''',
+                """,
                 event_id,
                 target_type,
                 target_mxid,
@@ -663,25 +743,25 @@ class DeliveryJobRepository:
             )
             if row is None:
                 row = await connection.fetchrow(
-                    '''
+                    """
                     SELECT * FROM delivery_jobs
                     WHERE event_id = $1
                       AND target_type = $2
                       AND COALESCE(target_mxid, '') = COALESCE($3, '')
                       AND COALESCE(matrix_room_id, '') = COALESCE($4, '')
-                    ''',
+                    """,
                     event_id,
                     target_type,
                     target_mxid,
                     matrix_room_id,
                 )
         assert row is not None
-        return DeliveryJobRecord(**dict(row))
+        return _record_to_delivery_job(row)
 
     async def claim_next_job(self) -> DeliveryJobRecord | None:
         async with self._pool.acquire() as connection:
             row = await connection.fetchrow(
-                '''
+                """
                 WITH next_job AS (
                     SELECT id
                     FROM delivery_jobs
@@ -697,32 +777,32 @@ class DeliveryJobRepository:
                     updated_at = NOW()
                 WHERE id IN (SELECT id FROM next_job)
                 RETURNING *
-                '''
+                """
             )
-        return DeliveryJobRecord(**dict(row)) if row is not None else None
+        return _record_to_delivery_job(row) if row is not None else None
 
     async def mark_complete(self, job_id: int) -> None:
         async with self._pool.acquire() as connection:
             await connection.execute(
-                '''
+                """
                 UPDATE delivery_jobs
                 SET status = 'complete', updated_at = NOW(), last_error = NULL
                 WHERE id = $1
-                ''',
+                """,
                 job_id,
             )
 
     async def mark_failed(self, job_id: int, *, error: str, next_attempt_at: datetime) -> None:
         async with self._pool.acquire() as connection:
             await connection.execute(
-                '''
+                """
                 UPDATE delivery_jobs
                 SET status = 'failed',
                     last_error = $2,
                     next_attempt_at = $3,
                     updated_at = NOW()
                 WHERE id = $1
-                ''',
+                """,
                 job_id,
                 error,
                 next_attempt_at,
@@ -730,8 +810,8 @@ class DeliveryJobRepository:
 
     async def get(self, job_id: int) -> DeliveryJobRecord | None:
         async with self._pool.acquire() as connection:
-            row = await connection.fetchrow('SELECT * FROM delivery_jobs WHERE id = $1', job_id)
-        return DeliveryJobRecord(**dict(row)) if row is not None else None
+            row = await connection.fetchrow("SELECT * FROM delivery_jobs WHERE id = $1", job_id)
+        return _record_to_delivery_job(row) if row is not None else None
 
 
 class DeliveryMessageRepository:
@@ -751,7 +831,7 @@ class DeliveryMessageRepository:
     ) -> DeliveryMessageRecord:
         async with self._pool.acquire() as connection:
             row = await connection.fetchrow(
-                '''
+                """
                 INSERT INTO delivery_messages (
                     discourse_topic_id,
                     discourse_post_id,
@@ -765,7 +845,7 @@ class DeliveryMessageRepository:
                 VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
                 ON CONFLICT DO NOTHING
                 RETURNING *
-                ''',
+                """,
                 discourse_topic_id,
                 discourse_post_id,
                 matrix_room_id,
@@ -776,50 +856,50 @@ class DeliveryMessageRepository:
             )
             if row is None:
                 row = await connection.fetchrow(
-                    '''
+                    """
                     SELECT * FROM delivery_messages
                     WHERE discourse_post_id = $1
                       AND matrix_room_id = $2
                       AND target_type = $3
                       AND COALESCE(target_mxid, '') = COALESCE($4, '')
-                    ''',
+                    """,
                     discourse_post_id,
                     matrix_room_id,
                     target_type,
                     target_mxid,
                 )
         assert row is not None
-        return DeliveryMessageRecord(**dict(row))
+        return _record_to_delivery_message(row)
 
     async def get_by_matrix_event(
         self, *, matrix_room_id: str, matrix_event_id: str
     ) -> DeliveryMessageRecord | None:
         async with self._pool.acquire() as connection:
             row = await connection.fetchrow(
-                '''
+                """
                 SELECT * FROM delivery_messages
                 WHERE matrix_room_id = $1 AND matrix_event_id = $2
-                ''',
+                """,
                 matrix_room_id,
                 matrix_event_id,
             )
-        return DeliveryMessageRecord(**dict(row)) if row is not None else None
+        return _record_to_delivery_message(row) if row is not None else None
 
     async def get_by_discourse_post_and_room(
         self, *, discourse_post_id: int, matrix_room_id: str
     ) -> DeliveryMessageRecord | None:
         async with self._pool.acquire() as connection:
             row = await connection.fetchrow(
-                '''
+                """
                 SELECT * FROM delivery_messages
                 WHERE discourse_post_id = $1 AND matrix_room_id = $2
                 ORDER BY id DESC
                 LIMIT 1
-                ''',
+                """,
                 discourse_post_id,
                 matrix_room_id,
             )
-        return DeliveryMessageRecord(**dict(row)) if row is not None else None
+        return _record_to_delivery_message(row) if row is not None else None
 
 
 class AuditLogRepository:
@@ -829,7 +909,7 @@ class AuditLogRepository:
     async def record(self, entry: AuditEntry) -> None:
         async with self._pool.acquire() as connection:
             await connection.execute(
-                '''
+                """
                 INSERT INTO audit_logs (
                     action,
                     mxid,
@@ -845,7 +925,7 @@ class AuditLogRepository:
                     created_at
                 )
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                ''',
+                """,
                 entry.action,
                 entry.mxid,
                 entry.platform,

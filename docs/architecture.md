@@ -11,3 +11,14 @@ Current dependency choices:
 - `pydantic-settings` for validated environment configuration.
 
 The current codebase provides a tested domain baseline. Matrix sync, Discourse polling persistence, and production worker orchestration still need to be expanded.
+
+Current implemented runtime slices:
+
+- startup applies SQL migrations with `asyncpg`
+- category metadata is synced from Discourse into PostgreSQL
+- YAML room links are loaded into PostgreSQL
+- Matrix sync is used to accept invites and inspect incoming text messages
+- slash commands are persisted through PostgreSQL-backed pairing and watch state
+- Matrix replies to bridged messages can post back to Discourse
+- Discourse polling stores normalized events and enqueues delivery jobs
+- delivery jobs are claimed atomically with `FOR UPDATE SKIP LOCKED`
