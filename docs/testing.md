@@ -5,6 +5,7 @@ Run the standard checks with `just check`.
 Current test layers:
 
 - unit tests for command, pairing, i18n, permissions, and bridge logic
+- unit tests for runtime loop helpers and delivery draining
 - mocked E2E tests for pairing and watch flows
 - PostgreSQL integration tests using Docker-backed temporary Postgres containers
 - live E2E scaffold, skipped by default

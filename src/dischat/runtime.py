@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+import asyncpg
+
 from dischat.config import FileConfig, Settings
 from dischat.discourse.client import DiscourseClient
 from dischat.matrix.client import NioMatrixClient
@@ -24,6 +26,7 @@ from dischat.storage.repositories import (
 
 @dataclass(slots=True)
 class AppContext:
+    pool: asyncpg.Pool
     settings: Settings
     file_config: FileConfig
     discourse_client: DiscourseClient
@@ -38,6 +41,11 @@ class AppContext:
     delivery_messages: DeliveryMessageRepository
     audit_logs: AuditLogRepository
     service: DischatService
+
+    async def close(self) -> None:
+        await self.discourse_client.close()
+        await self.matrix_client.close()
+        await self.pool.close()
 
 
 async def build_context(settings: Settings) -> AppContext:
@@ -72,6 +80,7 @@ async def build_context(settings: Settings) -> AppContext:
         pairing_service=PairingService(),
     )
     return AppContext(
+        pool=pool,
         settings=settings,
         file_config=file_config,
         discourse_client=discourse_client,

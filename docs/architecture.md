@@ -10,7 +10,7 @@ Current dependency choices:
 - SQL migration files with a minimal internal runner to avoid unnecessary ORM weight.
 - `pydantic-settings` for validated environment configuration.
 
-The current codebase provides a tested domain baseline. Matrix sync, Discourse polling persistence, and production worker orchestration still need to be expanded.
+The current codebase provides a tested domain baseline and now runs as a continuous asyncio daemon.
 
 Current implemented runtime slices:
 
@@ -22,3 +22,5 @@ Current implemented runtime slices:
 - Matrix replies to bridged messages can post back to Discourse
 - Discourse polling stores normalized events and enqueues delivery jobs
 - delivery jobs are claimed atomically with `FOR UPDATE SKIP LOCKED`
+- the main runtime continuously long-polls Matrix, polls Discourse, and drains queued deliveries
+- runtime shutdown closes Matrix, Discourse, and PostgreSQL clients cleanly
