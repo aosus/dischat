@@ -29,6 +29,7 @@ dev = [
   "pytest-cov>=6,<7",
   "respx>=0.22,<0.23",
   "ruff>=0.11.13,<0.12",
+  "testcontainers[postgres]>=4.14,<5",
   "ty>=0.0.40,<0.1",
 ]
 

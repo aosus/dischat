@@ -1,10 +1,13 @@
 README.md
 pyproject.toml
 src/dischat/__init__.py
+src/dischat/bridge.py
 src/dischat/config.py
 src/dischat/i18n.py
 src/dischat/logging.py
 src/dischat/main.py
+src/dischat/runtime.py
+src/dischat/service.py
 src/dischat.egg-info/PKG-INFO
 src/dischat.egg-info/SOURCES.txt
 src/dischat.egg-info/dependency_links.txt
@@ -19,6 +22,8 @@ src/dischat/discourse/client.py
 src/dischat/discourse/formatting.py
 src/dischat/discourse/models.py
 src/dischat/discourse/polling.py
+src/dischat/discourse/router.py
+src/dischat/discourse/sync.py
 src/dischat/jobs/__init__.py
 src/dischat/jobs/queue.py
 src/dischat/jobs/workers.py
@@ -38,6 +43,7 @@ src/dischat/storage/__init__.py
 src/dischat/storage/db.py
 src/dischat/storage/repositories.py
 src/dischat/subscriptions/__init__.py
+src/dischat/subscriptions/bootstrap.py
 src/dischat/subscriptions/categories.py
 src/dischat/subscriptions/service.py
 src/dischat/testing/__init__.py

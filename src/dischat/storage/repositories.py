@@ -620,6 +620,11 @@ class DiscourseEventRepository:
             )
         return DiscourseEventRecord(**dict(row)) if row is not None else None
 
+    async def get_by_id(self, event_id: int) -> DiscourseEventRecord | None:
+        async with self._pool.acquire() as connection:
+            row = await connection.fetchrow('SELECT * FROM discourse_events WHERE id = $1', event_id)
+        return DiscourseEventRecord(**dict(row)) if row is not None else None
+
 
 class DeliveryJobRepository:
     def __init__(self, pool: asyncpg.Pool) -> None:

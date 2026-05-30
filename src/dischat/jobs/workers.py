@@ -26,7 +26,7 @@ async def deliver_job(
     chat_accounts: ChatAccountRepository,
     matrix_client: MatrixClient,
 ) -> WorkerResult:
-    event = await discourse_events.get_by_discourse_post_id(job.event_id)
+    event = await discourse_events.get_by_id(job.event_id)
     if event is None:
         return WorkerResult(complete=False, error='missing_discourse_event')
     body = str(event.raw_payload_json.get('raw', ''))

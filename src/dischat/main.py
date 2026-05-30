@@ -7,6 +7,7 @@ from dischat.config import load_settings
 from dischat.discourse.sync import PollerState, poll_once
 from dischat.jobs.workers import deliver_job
 from dischat.logging import configure_logging
+from dischat.matrix.handler import process_sync_messages
 from dischat.runtime import build_context
 from dischat.service import backoff_delay
 from dischat.subscriptions.bootstrap import (
@@ -38,6 +39,20 @@ async def run() -> None:
     poll_state = PollerState()
     sync_response = await context.matrix_client.sync_once()
     await context.matrix_client.accept_invites(sync_response)
+    await process_sync_messages(
+        matrix_client=context.matrix_client,
+        service=context.service,
+        discourse_client=context.discourse_client,
+        chat_accounts=context.chat_accounts,
+        room_links=context.room_links,
+        delivery_messages=context.delivery_messages,
+        audit_logs=context.audit_logs,
+        relay_matrix_username=settings.discourse_relay_matrix_username,
+        relay_telegram_username=settings.discourse_relay_telegram_username,
+        relay_discord_username=settings.discourse_relay_discord_username,
+        live_e2e_category_id=settings.discourse_test_category_id,
+        sync_response=sync_response,
+    )
 
     processed = await poll_once(
         client=context.discourse_client,
