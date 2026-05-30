@@ -16,10 +16,27 @@ class FakeDiscourseWriteResult:
 
 class FakeDiscourseClient:
     def __init__(self) -> None:
-        self.calls: list[tuple[int, str]] = []
+        self.calls: list[dict[str, object]] = []
 
-    async def create_reply(self, *, topic_id: int, raw: str):
-        self.calls.append((topic_id, raw))
+    async def get_post(self, post_id: int) -> dict[str, object]:
+        return {"post_number": 2}
+
+    async def create_reply(
+        self,
+        *,
+        topic_id: int,
+        raw: str,
+        reply_to_post_number: int | None = None,
+        api_username: str | None = None,
+    ):
+        self.calls.append(
+            {
+                "topic_id": topic_id,
+                "raw": raw,
+                "reply_to_post_number": reply_to_post_number,
+                "api_username": api_username,
+            }
+        )
         return FakeDiscourseWriteResult(post_id=99, topic_id=topic_id, raw=raw)
 
 
@@ -72,6 +89,9 @@ class FakeRoomLinks:
 
 
 class FakeDeliveryMessages:
+    def __init__(self) -> None:
+        self.created: list[dict[str, object]] = []
+
     async def get_by_matrix_event(
         self, *, matrix_room_id: str, matrix_event_id: str
     ) -> DeliveryMessageRecord | None:
@@ -84,6 +104,39 @@ class FakeDeliveryMessages:
             target_type="room",
             target_mxid=None,
             parent_delivery_message_id=None,
+        )
+
+    async def create_mapping(
+        self,
+        *,
+        discourse_topic_id: int,
+        discourse_post_id: int,
+        matrix_room_id: str,
+        matrix_event_id: str,
+        target_type: str,
+        target_mxid: str | None,
+        parent_delivery_message_id: int | None,
+    ) -> DeliveryMessageRecord:
+        self.created.append(
+            {
+                "discourse_topic_id": discourse_topic_id,
+                "discourse_post_id": discourse_post_id,
+                "matrix_room_id": matrix_room_id,
+                "matrix_event_id": matrix_event_id,
+                "target_type": target_type,
+                "target_mxid": target_mxid,
+                "parent_delivery_message_id": parent_delivery_message_id,
+            }
+        )
+        return DeliveryMessageRecord(
+            id=len(self.created),
+            discourse_topic_id=discourse_topic_id,
+            discourse_post_id=discourse_post_id,
+            matrix_room_id=matrix_room_id,
+            matrix_event_id=matrix_event_id,
+            target_type=target_type,
+            target_mxid=target_mxid,
+            parent_delivery_message_id=parent_delivery_message_id,
         )
 
 
@@ -131,7 +184,14 @@ async def test_handle_matrix_reply_posts_as_paired_user() -> None:
 
     assert result.posted is True
     assert result.discourse_username == "alice"
-    assert discourse.calls == [(20, "hello discourse")]
+    assert discourse.calls == [
+        {
+            "topic_id": 20,
+            "raw": "hello discourse",
+            "reply_to_post_number": 2,
+            "api_username": "alice",
+        }
+    ]
     assert audit.entries[0].discourse_username_used == "alice"
 
 
@@ -170,6 +230,7 @@ async def test_handle_matrix_reply_uses_relay_when_allowed() -> None:
 
     assert result.posted is True
     assert result.discourse_username == "TelegramRelayUser"
+    assert discourse.calls[0]["api_username"] == "TelegramRelayUser"
 
 
 async def test_handle_matrix_reply_rejects_unpaired_user_when_relay_disabled() -> None:

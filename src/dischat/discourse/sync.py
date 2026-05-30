@@ -10,8 +10,10 @@ from dischat.storage.repositories import (
     CategoryRepository,
     ChatAccountRepository,
     DeliveryJobRepository,
+    DeliveryMessageRepository,
     DiscourseEventRepository,
     RoomLinkRepository,
+    UserWatchRepository,
 )
 
 
@@ -28,6 +30,8 @@ async def poll_once(
     discourse_events: DiscourseEventRepository,
     room_links: RoomLinkRepository,
     chat_accounts: ChatAccountRepository,
+    user_watches: UserWatchRepository,
+    delivery_messages: DeliveryMessageRepository,
     delivery_jobs: DeliveryJobRepository,
 ) -> int:
     posts = await client.list_latest_posts(before=None)
@@ -38,6 +42,14 @@ async def poll_once(
         if state.last_seen_post_id is not None and post_id <= state.last_seen_post_id:
             continue
         discourse_event: DiscourseEvent = normalize_post_event(post_payload)
+        if discourse_event.reply_to_post_number is not None:
+            topic_payload = await client.get_topic(discourse_event.discourse_topic_id)
+            for topic_post in topic_payload.get("post_stream", {}).get("posts", []):
+                if topic_post.get("post_number") == discourse_event.reply_to_post_number:
+                    discourse_event.raw_payload_json["reply_to_discourse_post_id"] = topic_post[
+                        "id"
+                    ]
+                    break
         stored = await discourse_events.create_event_if_missing(
             discourse_topic_id=discourse_event.discourse_topic_id,
             discourse_post_id=discourse_event.discourse_post_id,
@@ -56,8 +68,11 @@ async def poll_once(
             event_id=stored.id,
             discourse_event=discourse_event,
             category_slug=category_slug,
+            category_id=discourse_event.category_id,
             room_links=room_links,
             chat_accounts=chat_accounts,
+            user_watches=user_watches,
+            delivery_messages=delivery_messages,
             delivery_jobs=delivery_jobs,
         )
         state.last_seen_post_id = post_id

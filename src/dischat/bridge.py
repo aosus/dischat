@@ -25,7 +25,16 @@ class BridgeResult:
 
 
 class DiscourseReplyWriter(Protocol):
-    async def create_reply(self, *, topic_id: int, raw: str) -> DiscourseWriteResult: ...
+    async def get_post(self, post_id: int) -> dict[str, object]: ...
+
+    async def create_reply(
+        self,
+        *,
+        topic_id: int,
+        raw: str,
+        reply_to_post_number: int | None = None,
+        api_username: str | None = None,
+    ) -> DiscourseWriteResult: ...
 
 
 class ChatAccountsRepo(Protocol):
@@ -45,6 +54,18 @@ class DeliveryMessagesRepo(Protocol):
         matrix_room_id: str,
         matrix_event_id: str,
     ) -> DeliveryMessageRecord | None: ...
+
+    async def create_mapping(
+        self,
+        *,
+        discourse_topic_id: int,
+        discourse_post_id: int,
+        matrix_room_id: str,
+        matrix_event_id: str,
+        target_type: str,
+        target_mxid: str | None,
+        parent_delivery_message_id: int | None,
+    ) -> DeliveryMessageRecord: ...
 
 
 class AuditLogsRepo(Protocol):
@@ -113,10 +134,31 @@ async def handle_matrix_reply(
             discord=relay_discord_username,
         )
     assert discourse_username is not None
+    parent_post = await discourse_client.get_post(parent.discourse_post_id)
+    reply_to_post_number = parent_post.get("post_number")
+    if not isinstance(reply_to_post_number, int):
+        response = await matrix_client.send_notice(
+            message.room_id,
+            translate("posting.requires_pairing", account.response_locale),
+        )
+        return BridgeResult(
+            posted=False, error_message="missing_parent_post_number", matrix_response=response
+        )
 
     write_result: DiscourseWriteResult = await discourse_client.create_reply(
         topic_id=parent.discourse_topic_id,
         raw=message.body,
+        reply_to_post_number=reply_to_post_number,
+        api_username=discourse_username,
+    )
+    await delivery_messages.create_mapping(
+        discourse_topic_id=write_result.topic_id,
+        discourse_post_id=write_result.post_id,
+        matrix_room_id=message.room_id,
+        matrix_event_id=message.event_id,
+        target_type="room",
+        target_mxid=None,
+        parent_delivery_message_id=parent.id,
     )
     await audit_logs.record(
         AuditEntry(

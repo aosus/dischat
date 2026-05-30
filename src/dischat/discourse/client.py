@@ -35,15 +35,26 @@ class DiscourseClient:
             "Content-Type": "application/json",
         }
 
+    def headers_for_user(self, api_username: str | None = None) -> dict[str, str]:
+        headers = dict(self.headers)
+        if api_username is not None:
+            headers["Api-Username"] = api_username
+        return headers
+
     async def close(self) -> None:
         await self._client.aclose()
 
     async def create_private_message(
-        self, *, target_username: str, title: str, raw: str
+        self,
+        *,
+        target_username: str,
+        title: str,
+        raw: str,
+        api_username: str | None = None,
     ) -> DiscourseWriteResult:
         response = await self._client.post(
             "/posts.json",
-            headers=self.headers,
+            headers=self.headers_for_user(api_username),
             json={
                 "title": title,
                 "raw": raw,
@@ -61,12 +72,21 @@ class DiscourseClient:
         )
 
     async def create_reply(
-        self, *, topic_id: int, raw: str, reply_to_post_number: int | None = None
+        self,
+        *,
+        topic_id: int,
+        raw: str,
+        reply_to_post_number: int | None = None,
+        api_username: str | None = None,
     ) -> DiscourseWriteResult:
         body: dict[str, Any] = {"topic_id": topic_id, "raw": raw}
         if reply_to_post_number is not None:
             body["reply_to_post_number"] = reply_to_post_number
-        response = await self._client.post("/posts.json", headers=self.headers, json=body)
+        response = await self._client.post(
+            "/posts.json",
+            headers=self.headers_for_user(api_username),
+            json=body,
+        )
         response.raise_for_status()
         payload: dict[str, Any] = response.json()
         return DiscourseWriteResult(

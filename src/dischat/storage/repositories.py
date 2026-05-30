@@ -506,6 +506,20 @@ class UserWatchRepository:
             )
         return [UserWatchRecord(**dict(row)) for row in rows]
 
+    async def list_mxids_for_category(self, *, category_id: int) -> list[str]:
+        async with self._pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT DISTINCT mxid
+                FROM user_watches
+                WHERE (mode = 'category' AND category_id = $1)
+                   OR (mode = 'all_public_categories' AND category_id IS NULL)
+                ORDER BY mxid
+                """,
+                category_id,
+            )
+        return [str(row["mxid"]) for row in rows]
+
 
 class RoomLinkRepository:
     def __init__(self, pool: asyncpg.Pool) -> None:
@@ -900,6 +914,16 @@ class DeliveryMessageRepository:
                 matrix_room_id,
             )
         return _record_to_delivery_message(row) if row is not None else None
+
+    async def list_by_discourse_post(
+        self, *, discourse_post_id: int
+    ) -> list[DeliveryMessageRecord]:
+        async with self._pool.acquire() as connection:
+            rows = await connection.fetch(
+                "SELECT * FROM delivery_messages WHERE discourse_post_id = $1 ORDER BY id",
+                discourse_post_id,
+            )
+        return [_record_to_delivery_message(row) for row in rows]
 
 
 class AuditLogRepository:

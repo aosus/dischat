@@ -61,6 +61,8 @@ async def run() -> None:
         discourse_events=context.discourse_events,
         room_links=context.room_links,
         chat_accounts=context.chat_accounts,
+        user_watches=context.user_watches,
+        delivery_messages=context.delivery_messages,
         delivery_jobs=context.delivery_jobs,
     )
     logger.info("Processed %s Discourse events", processed)
@@ -74,6 +76,7 @@ async def run() -> None:
             discourse_events=context.discourse_events,
             delivery_messages=context.delivery_messages,
             chat_accounts=context.chat_accounts,
+            room_links=context.room_links,
             matrix_client=context.matrix_client,
         )
         if result.complete:
