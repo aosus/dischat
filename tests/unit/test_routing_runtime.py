@@ -60,9 +60,14 @@ class FakeDiscourseClient:
 
 class FakeMatrixClient:
     def __init__(self) -> None:
+        self.texts: list[tuple[str, str]] = []
         self.notices: list[tuple[str, str]] = []
         self.dms: list[tuple[str, str]] = []
         self.replies: list[tuple[str, str, str]] = []
+
+    async def send_text(self, room_id: str, body: str) -> MatrixSendResult:
+        self.texts.append((room_id, body))
+        return MatrixSendResult(event_id="$text", room_id=room_id)
 
     async def send_notice(self, room_id: str, body: str) -> MatrixSendResult:
         self.notices.append((room_id, body))
@@ -438,7 +443,7 @@ async def test_poll_once_resolves_parent_discourse_post_id_before_routing() -> N
         }
     }
     categories = FakeCategories()
-    categories.categories[10] = type("Category", (), {"slug": "support"})()
+    categories.categories[10] = type("Category", (), {"id": 1, "slug": "support"})()
     discourse_events = FakeDiscourseEvents()
 
     processed = await poll_once(
@@ -477,6 +482,7 @@ async def test_deliver_job_uses_excerpt_and_thread_reply_for_room_jobs() -> None
             "discourse_topic_id": 20,
             "discourse_post_id": 31,
             "raw_payload_json": {
+                "topic_title": "Support topic",
                 "raw": "word " * 100,
                 "reply_to_discourse_post_id": 30,
             },
@@ -516,5 +522,59 @@ async def test_deliver_job_uses_excerpt_and_thread_reply_for_room_jobs() -> None
     assert result.complete is True
     assert matrix.replies
     assert matrix.notices == []
-    assert len(matrix.replies[0][1]) <= 280
+    assert matrix.texts == []
+    assert matrix.replies[0][1].startswith("# Support topic\n\n")
+    assert matrix.replies[0][1].endswith("…")
     assert delivery_messages.created[0]["parent_delivery_message_id"] == 2
+
+
+async def test_deliver_job_formats_new_topic_with_title_for_room_jobs() -> None:
+    matrix = FakeMatrixClient()
+    room_link = RoomLinkRecord(
+        id=1,
+        matrix_room_id="!room:test",
+        include_all_public_categories=False,
+        allow_relay=False,
+        full_content=True,
+        enabled=True,
+        category_slugs=("support",),
+    )
+    room_links = FakeRoomLinks(room_link)
+    discourse_events = FakeDiscourseEvents()
+    discourse_events.by_id[1] = type(
+        "Event",
+        (),
+        {
+            "discourse_topic_id": 20,
+            "discourse_post_id": 31,
+            "raw_payload_json": {
+                "topic_title": "Support topic",
+                "raw": "Detailed body",
+            },
+        },
+    )()
+    delivery_messages = FakeDeliveryMessages()
+
+    result = await deliver_job(
+        job=DeliveryJobRecord(
+            id=1,
+            event_id=1,
+            target_type="room",
+            target_mxid=None,
+            matrix_room_id="!room:test",
+            status="pending",
+            attempts=0,
+            next_attempt_at=__import__("datetime").datetime.now(__import__("datetime").UTC),
+            last_error=None,
+        ),
+        discourse_events=discourse_events,
+        delivery_messages=delivery_messages,
+        chat_accounts=FakeChatAccounts(),
+        room_links=room_links,
+        matrix_client=matrix,
+    )
+
+    assert result.complete is True
+    assert matrix.texts == [("!room:test", "# Support topic\n\nDetailed body")]
+    assert matrix.notices == []
+    assert matrix.replies == []

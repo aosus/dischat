@@ -1,8 +1,11 @@
 .coverage
+.env
+.env.live-e2e
 .pytest_cache/
 .ruff_cache/
 .venv/
 __pycache__/
 *.pyc
+config.live-e2e.yaml
 site/
 htmlcov/

@@ -75,6 +75,7 @@ async def run_iteration(
         user_watches=context.user_watches,
         delivery_messages=context.delivery_messages,
         delivery_jobs=context.delivery_jobs,
+        live_e2e_category_id=settings.discourse_test_category_id,
     )
     if processed:
         logger.info("Processed %s Discourse events", processed)

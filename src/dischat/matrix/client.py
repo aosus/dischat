@@ -1,21 +1,24 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, ClassVar, Protocol
 
 from nio import (
     AsyncClient,
+    AsyncClientConfig,
     InviteMemberEvent,
+    JoinResponse,
     LoginError,
     LoginResponse,
     RoomCreateResponse,
     RoomGetEventResponse,
+    RoomInviteResponse,
     RoomMessageText,
     RoomSendResponse,
     SyncResponse,
 )
 
-from dischat.matrix.formatting import plain_notice, reply_message
+from dischat.matrix.formatting import plain_notice, plain_text, reply_message
 
 
 @dataclass(slots=True, frozen=True)
@@ -34,6 +37,8 @@ class MatrixMessage:
 
 
 class MatrixClient(Protocol):
+    async def send_text(self, room_id: str, body: str) -> MatrixSendResult: ...
+
     async def send_notice(self, room_id: str, body: str) -> MatrixSendResult: ...
 
     async def send_reply(
@@ -44,6 +49,8 @@ class MatrixClient(Protocol):
 
 
 class NioMatrixClient:
+    _access_token_cache: ClassVar[dict[tuple[str, str], str]] = {}
+
     def __init__(
         self,
         *,
@@ -52,14 +59,30 @@ class NioMatrixClient:
         access_token: str | None,
         password: str | None,
     ) -> None:
-        self._client = AsyncClient(homeserver_url, user_id)
+        self._cache_key = (homeserver_url, user_id)
+        self._client = AsyncClient(
+            homeserver_url,
+            user_id,
+            config=AsyncClientConfig(
+                max_limit_exceeded=0,
+                request_timeout=30,
+            ),
+        )
+        cached_access_token = self._access_token_cache.get(self._cache_key)
         if access_token is not None:
             self._client.access_token = access_token
+            self._access_token_cache[self._cache_key] = access_token
+        elif cached_access_token is not None:
+            self._client.access_token = cached_access_token
         self._password = password
 
     @property
     def user_id(self) -> str:
         return self._client.user_id
+
+    @property
+    def access_token(self) -> str | None:
+        return self._client.access_token
 
     async def login(self) -> None:
         if self._client.access_token:
@@ -70,9 +93,25 @@ class NioMatrixClient:
         if isinstance(response, LoginError):
             raise ValueError(f"Matrix login failed: {response.message}")
         assert isinstance(response, LoginResponse)
+        if self._client.access_token is not None:
+            self._access_token_cache[self._cache_key] = self._client.access_token
 
     async def close(self) -> None:
         await self._client.close()
+
+    async def invite_user(self, room_id: str, mxid: str) -> None:
+        response = await self._client.room_invite(room_id, mxid)
+        if not isinstance(response, RoomInviteResponse):
+            if "already in the room" in str(response) or "is already invited" in str(response):
+                return
+            raise ValueError(f"Matrix room_invite failed: {response}")
+
+    async def join_room(self, room_id: str) -> None:
+        response = await self._client.join(room_id)
+        if not isinstance(response, JoinResponse):
+            if "already in the room" in str(response):
+                return
+            raise ValueError(f"Matrix join failed: {response}")
 
     async def sync_once(self, *, since: str | None = None, timeout_ms: int = 0) -> SyncResponse:
         response = await self._client.sync(
@@ -92,6 +131,12 @@ class NioMatrixClient:
         response = await self._client.room_send(room_id, "m.room.message", plain_notice(body))
         if not isinstance(response, RoomSendResponse):
             raise ValueError(f"Matrix send_notice failed: {response}")
+        return MatrixSendResult(event_id=response.event_id, room_id=room_id)
+
+    async def send_text(self, room_id: str, body: str) -> MatrixSendResult:
+        response = await self._client.room_send(room_id, "m.room.message", plain_text(body))
+        if not isinstance(response, RoomSendResponse):
+            raise ValueError(f"Matrix send_text failed: {response}")
         return MatrixSendResult(event_id=response.event_id, room_id=room_id)
 
     async def send_reply(self, room_id: str, body: str, parent_event_id: str) -> MatrixSendResult:
@@ -120,7 +165,7 @@ class NioMatrixClient:
 
     async def send_dm(self, mxid: str, body: str) -> MatrixSendResult:
         room_id = await self.ensure_dm_room(mxid)
-        response = await self.send_notice(room_id, body)
+        response = await self.send_text(room_id, body)
         return MatrixSendResult(event_id=response.event_id, room_id=room_id)
 
     async def get_event(self, *, room_id: str, event_id: str) -> dict[str, Any]:

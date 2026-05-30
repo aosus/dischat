@@ -8,6 +8,6 @@ Current test layers:
 - unit tests for runtime loop helpers and delivery draining
 - mocked E2E tests for pairing and watch flows
 - PostgreSQL integration tests using Docker-backed temporary Postgres containers
-- live E2E scaffold, skipped by default
+- live E2E coverage for room relay roundtrip and watched-category DM delivery, disabled by default
 
 The PostgreSQL integration tests require Docker to be available locally and in CI.

@@ -1,7 +1,15 @@
 from typing import cast
 
-from dischat.matrix.formatting import plain_notice, reply_message
+from dischat.matrix.formatting import plain_notice, plain_text, reply_message
 from dischat.matrix.replies import get_reply_parent_event_id
+
+
+def test_plain_text_uses_text_type() -> None:
+    payload = plain_text("# Hello\n\nWorld")
+
+    assert payload["msgtype"] == "m.text"
+    assert payload["format"] == "org.matrix.custom.html"
+    assert payload["formatted_body"] == "<h1>Hello</h1><p>World</p>"
 
 
 def test_plain_notice_uses_notice_type() -> None:
@@ -14,6 +22,7 @@ def test_reply_message_embeds_parent_event() -> None:
 
     in_reply_to = cast(dict[str, str], relates_to["m.in_reply_to"])
     assert in_reply_to["event_id"] == "$abc"
+    assert payload["format"] == "org.matrix.custom.html"
 
 
 def test_get_reply_parent_event_id_reads_relation() -> None:

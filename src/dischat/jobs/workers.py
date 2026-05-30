@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
-from dischat.discourse.formatting import excerpt_text
+from dischat.discourse.formatting import excerpt_text, format_topic_delivery
 from dischat.i18n import translate
 from dischat.matrix.client import MatrixClient
 from dischat.storage.repositories import (
@@ -20,6 +21,30 @@ class WorkerResult:
     error: str | None = None
 
 
+def _render_discourse_body(payload: dict[str, object]) -> str:
+    raw = payload.get("raw")
+    if isinstance(raw, str) and raw.strip():
+        return raw
+    cooked = payload.get("cooked")
+    if not isinstance(cooked, str) or not cooked.strip():
+        return ""
+    # Topic reads on this Discourse instance expose cooked HTML but may omit raw.
+    text = re.sub(r"<br\s*/?>", "\n", cooked)
+    text = re.sub(r"</p>", "\n\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = text.replace("&nbsp;", " ")
+    return text.strip()
+
+
+def _render_delivery_body(payload: dict[str, object], *, full_content: bool) -> str:
+    body = _render_discourse_body(payload)
+    title = payload.get("topic_title")
+    if payload.get("reply_to_post_number") is None and isinstance(title, str) and title.strip():
+        topic_body = body if full_content else excerpt_text(body)
+        return format_topic_delivery(title=title, body=topic_body)
+    return body if full_content else excerpt_text(body)
+
+
 async def deliver_job(
     *,
     job: DeliveryJobRecord,
@@ -32,11 +57,11 @@ async def deliver_job(
     event = await discourse_events.get_by_id(job.event_id)
     if event is None:
         return WorkerResult(complete=False, error="missing_discourse_event")
-    body = str(event.raw_payload_json.get("raw", ""))
     if job.target_type == "room" and job.matrix_room_id is not None:
         room_link = await room_links.get_by_room_id(job.matrix_room_id)
-        rendered_body = (
-            body if room_link is not None and room_link.full_content else excerpt_text(body)
+        rendered_body = _render_delivery_body(
+            event.raw_payload_json,
+            full_content=room_link is not None and room_link.full_content,
         )
         parent_mapping = None
         reply_to_post_id = event.raw_payload_json.get("reply_to_discourse_post_id")
@@ -52,7 +77,7 @@ async def deliver_job(
                 parent_mapping.matrix_event_id,
             )
         else:
-            result = await matrix_client.send_notice(job.matrix_room_id, rendered_body)
+            result = await matrix_client.send_text(job.matrix_room_id, rendered_body)
         await delivery_messages.create_mapping(
             discourse_topic_id=event.discourse_topic_id,
             discourse_post_id=event.discourse_post_id,
@@ -66,6 +91,7 @@ async def deliver_job(
     if job.target_type == "dm" and job.target_mxid is not None:
         account = await chat_accounts.get_by_mxid(job.target_mxid)
         locale = account.response_locale if account is not None else "en"
+        body = _render_delivery_body(event.raw_payload_json, full_content=True)
         result = await matrix_client.send_dm(
             job.target_mxid,
             body or translate("pairing.unpaired", locale),

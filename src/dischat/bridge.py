@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol, cast
+
+import httpx
 
 from dischat.discourse.client import DiscourseWriteResult
 from dischat.i18n import translate
@@ -26,6 +28,8 @@ class BridgeResult:
 
 class DiscourseReplyWriter(Protocol):
     async def get_post(self, post_id: int) -> dict[str, object]: ...
+
+    async def get_topic(self, topic_id: int) -> dict[str, object]: ...
 
     async def create_reply(
         self,
@@ -134,8 +138,24 @@ async def handle_matrix_reply(
             discord=relay_discord_username,
         )
     assert discourse_username is not None
-    parent_post = await discourse_client.get_post(parent.discourse_post_id)
+    try:
+        parent_post = await discourse_client.get_post(parent.discourse_post_id)
+    except httpx.HTTPError:
+        parent_post = {}
     reply_to_post_number = parent_post.get("post_number")
+    if not isinstance(reply_to_post_number, int):
+        topic_payload = await discourse_client.get_topic(parent.discourse_topic_id)
+        post_stream = topic_payload.get("post_stream")
+        topic_posts: list[dict[str, Any]] = []
+        if isinstance(post_stream, dict):
+            post_stream_dict = cast("dict[str, Any]", post_stream)
+            posts = post_stream_dict.get("posts")
+            if isinstance(posts, list):
+                topic_posts = [post for post in posts if isinstance(post, dict)]
+        for topic_post in topic_posts:
+            if topic_post.get("id") == parent.discourse_post_id:
+                reply_to_post_number = topic_post.get("post_number")
+                break
     if not isinstance(reply_to_post_number, int):
         response = await matrix_client.send_notice(
             message.room_id,

@@ -147,6 +147,9 @@ def _record_to_category(row: asyncpg.Record) -> CategoryRecord:
 
 
 def _record_to_discourse_event(row: asyncpg.Record) -> DiscourseEventRecord:
+    raw_payload = row["raw_payload_json"]
+    if isinstance(raw_payload, str):
+        raw_payload = json.loads(raw_payload)
     return DiscourseEventRecord(
         id=row["id"],
         discourse_topic_id=row["discourse_topic_id"],
@@ -155,7 +158,7 @@ def _record_to_discourse_event(row: asyncpg.Record) -> DiscourseEventRecord:
         category_id=row["category_id"],
         author_username=row["author_username"],
         target_discourse_username=row["target_discourse_username"],
-        raw_payload_json=row["raw_payload_json"],
+        raw_payload_json=raw_payload,
     )
 
 
