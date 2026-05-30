@@ -1,0 +1,5 @@
+rooms:
+  "!zXyndruOpMwMnDYzYA:aosus.org":
+    categories: ["dischat-test"]
+    allow_relay: true
+    full_content: true

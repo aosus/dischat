@@ -1,0 +1,26 @@
+Metadata-Version: 2.4
+Name: dischat
+Version: 0.1.0
+Summary: Bridge public Discourse activity into Matrix chat rooms and DMs
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: asyncpg<0.32,>=0.31
+Requires-Dist: httpx<0.29,>=0.28
+Requires-Dist: matrix-nio<0.26,>=0.25.2
+Requires-Dist: pydantic<3,>=2.11
+Requires-Dist: pydantic-settings<3,>=2.14
+Requires-Dist: PyYAML<7,>=6.0.2
+
+# Dischat
+
+Dischat bridges public Discourse activity into Matrix rooms and Matrix direct messages.
+
+The repository is built around:
+
+- `uv` for environment and dependency management
+- `ruff` for linting and formatting
+- `ty` for type checking
+- `pytest` for automated tests
+- `MkDocs` for project documentation
+
+See `docs/` for setup, architecture, operations, and testing guidance.

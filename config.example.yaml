@@ -1,0 +1,15 @@
+rooms:
+  "!support:aosus.org":
+    categories: ["support"]
+    allow_relay: false
+    full_content: true
+
+  "!announcements:aosus.org":
+    categories: ["announcements"]
+    allow_relay: false
+    full_content: false
+
+  "!forum-all:aosus.org":
+    categories: ["all"]
+    allow_relay: true
+    full_content: true

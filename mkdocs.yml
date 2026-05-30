@@ -1,0 +1,27 @@
+site_name: Dischat
+site_description: Matrix bridge service for public Discourse activity
+theme:
+  name: material
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - Configuration: configuration.md
+  - Docker: docker.md
+  - Matrix Setup: matrix-setup.md
+  - Discourse Setup: discourse-setup.md
+  - Pairing Flow: pairing-flow.md
+  - Subscriptions: subscriptions.md
+  - Room Links: room-links.md
+  - Relay Accounts: relay-accounts.md
+  - Testing: testing.md
+  - Live E2E Testing: live-e2e-testing.md
+  - Architecture: architecture.md
+  - Operations: operations.md
+  - Security: security.md
+  - Troubleshooting: troubleshooting.md
+strict: true
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn

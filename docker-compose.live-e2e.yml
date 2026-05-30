@@ -1,0 +1,30 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: dischat
+      POSTGRES_USER: dischat
+      POSTGRES_PASSWORD: dischat
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dischat -d dischat"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  dischat:
+    build: .
+    env_file:
+      - .env.live-e2e
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  tests:
+    build: .
+    command: ["uv", "run", "pytest", "tests/e2e_live"]
+    env_file:
+      - .env.live-e2e
+    depends_on:
+      postgres:
+        condition: service_healthy

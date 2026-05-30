@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=80", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dischat"
+version = "0.1.0"
+description = "Bridge public Discourse activity into Matrix chat rooms and DMs"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "asyncpg>=0.31,<0.32",
+  "httpx>=0.28,<0.29",
+  "matrix-nio>=0.25.2,<0.26",
+  "pydantic>=2.11,<3",
+  "pydantic-settings>=2.14,<3",
+  "PyYAML>=6.0.2,<7",
+]
+
+[project.scripts]
+dischat = "dischat.main:main"
+
+[dependency-groups]
+dev = [
+  "mkdocs>=1.6,<2",
+  "mkdocs-material>=9.6,<10",
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=1.0,<2",
+  "pytest-cov>=6,<7",
+  "respx>=0.22,<0.23",
+  "ruff>=0.11.13,<0.12",
+  "ty>=0.0.40,<0.1",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+extend-select = ["B", "I", "UP"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.pytest.ini_options]
+addopts = "--cov=src --cov-report=term-missing"
+asyncio_mode = "auto"
+testpaths = ["tests"]
