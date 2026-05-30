@@ -21,6 +21,7 @@ class DiscoursePost:
 class DiscourseEvent:
     discourse_topic_id: int
     discourse_post_id: int
+    reply_to_post_number: int | None
     event_type: str
     category_id: int | None
     author_username: str

@@ -11,6 +11,7 @@ class DiscourseWriteResult:
     post_id: int
     topic_id: int
     raw: str
+    post_number: int | None = None
 
 
 class DiscourseClient:
@@ -53,7 +54,10 @@ class DiscourseClient:
         response.raise_for_status()
         payload: dict[str, Any] = response.json()
         return DiscourseWriteResult(
-            post_id=payload["id"], topic_id=payload["topic_id"], raw=payload["raw"]
+            post_id=payload["id"],
+            topic_id=payload["topic_id"],
+            raw=payload["raw"],
+            post_number=payload.get('post_number'),
         )
 
     async def create_reply(
@@ -66,7 +70,10 @@ class DiscourseClient:
         response.raise_for_status()
         payload: dict[str, Any] = response.json()
         return DiscourseWriteResult(
-            post_id=payload["id"], topic_id=payload["topic_id"], raw=payload["raw"]
+            post_id=payload["id"],
+            topic_id=payload["topic_id"],
+            raw=payload["raw"],
+            post_number=payload.get('post_number'),
         )
 
     async def list_latest_posts(self, *, before: int | None = None) -> list[dict[str, Any]]:
@@ -78,6 +85,11 @@ class DiscourseClient:
 
     async def get_topic(self, topic_id: int) -> dict[str, Any]:
         response = await self._client.get(f"/t/{topic_id}.json", headers=self.headers)
+        response.raise_for_status()
+        return dict(response.json())
+
+    async def get_post(self, post_id: int) -> dict[str, Any]:
+        response = await self._client.get(f'/posts/{post_id}.json', headers=self.headers)
         response.raise_for_status()
         return dict(response.json())
 

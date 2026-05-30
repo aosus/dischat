@@ -19,6 +19,7 @@ def normalize_post_event(post_payload: dict[str, Any]) -> DiscourseEvent:
     return DiscourseEvent(
         discourse_topic_id=post_payload["topic_id"],
         discourse_post_id=post_payload["id"],
+        reply_to_post_number=post_payload.get("reply_to_post_number"),
         event_type=event_type,
         category_id=post_payload.get("category_id"),
         author_username=post_payload["username"],
