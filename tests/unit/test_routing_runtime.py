@@ -60,25 +60,44 @@ class FakeDiscourseClient:
 
 class FakeMatrixClient:
     def __init__(self) -> None:
-        self.texts: list[tuple[str, str]] = []
+        self.texts: list[tuple[str, str, dict[str, str] | None]] = []
         self.notices: list[tuple[str, str]] = []
         self.dms: list[tuple[str, str]] = []
-        self.replies: list[tuple[str, str, str]] = []
+        self.replies: list[tuple[str, str, str, dict[str, str] | None]] = []
 
-    async def send_text(self, room_id: str, body: str) -> MatrixSendResult:
-        self.texts.append((room_id, body))
+    async def send_text(
+        self,
+        room_id: str,
+        body: str,
+        *,
+        formatted: dict[str, str] | None = None,
+    ) -> MatrixSendResult:
+        self.texts.append((room_id, body, formatted))
         return MatrixSendResult(event_id="$text", room_id=room_id)
 
     async def send_notice(self, room_id: str, body: str) -> MatrixSendResult:
         self.notices.append((room_id, body))
         return MatrixSendResult(event_id="$notice", room_id=room_id)
 
-    async def send_dm(self, mxid: str, body: str) -> MatrixSendResult:
+    async def send_dm(
+        self,
+        mxid: str,
+        body: str,
+        *,
+        formatted: dict[str, str] | None = None,
+    ) -> MatrixSendResult:
         self.dms.append((mxid, body))
         return MatrixSendResult(event_id="$dm", room_id="!dm:test")
 
-    async def send_reply(self, room_id: str, body: str, parent_event_id: str) -> MatrixSendResult:
-        self.replies.append((room_id, body, parent_event_id))
+    async def send_reply(
+        self,
+        room_id: str,
+        body: str,
+        parent_event_id: str,
+        *,
+        formatted: dict[str, str] | None = None,
+    ) -> MatrixSendResult:
+        self.replies.append((room_id, body, parent_event_id, formatted))
         return MatrixSendResult(event_id="$reply", room_id=room_id)
 
 
@@ -462,6 +481,50 @@ async def test_poll_once_resolves_parent_discourse_post_id_before_routing() -> N
     assert discourse_events.created[0]["raw_payload_json"]["reply_to_discourse_post_id"] == 30
 
 
+async def test_poll_once_backfills_cooked_html_from_topic_payload() -> None:
+    discourse = FakeDiscourseClient()
+    discourse.latest_posts = [
+        {
+            "id": 31,
+            "topic_id": 20,
+            "category_id": None,
+            "username": "alice",
+            "raw": "reply",
+        }
+    ]
+    discourse.topics[20] = {
+        "category_id": 10,
+        "title": "Support topic",
+        "post_stream": {
+            "posts": [
+                {"id": 31, "post_number": 1, "cooked": "<p><strong>Hello</strong> world</p>"},
+            ]
+        },
+    }
+    categories = FakeCategories()
+    categories.categories[10] = type("Category", (), {"id": 1, "slug": "support"})()
+    discourse_events = FakeDiscourseEvents()
+
+    processed = await poll_once(
+        client=discourse,
+        state=PollerState(),
+        categories=categories,
+        discourse_events=discourse_events,
+        room_links=FakeRoomLinks(),
+        chat_accounts=FakeChatAccounts(),
+        user_watches=FakeUserWatches(),
+        delivery_messages=FakeDeliveryMessages(),
+        delivery_jobs=FakeDeliveryJobs(),
+    )
+
+    assert processed == 1
+    assert discourse_events.created[0]["raw_payload_json"]["topic_title"] == "Support topic"
+    assert (
+        discourse_events.created[0]["raw_payload_json"]["cooked"]
+        == "<p><strong>Hello</strong> world</p>"
+    )
+
+
 async def test_deliver_job_uses_excerpt_and_thread_reply_for_room_jobs() -> None:
     matrix = FakeMatrixClient()
     room_link = RoomLinkRecord(
@@ -525,6 +588,10 @@ async def test_deliver_job_uses_excerpt_and_thread_reply_for_room_jobs() -> None
     assert matrix.texts == []
     assert matrix.replies[0][1].startswith("# Support topic\n\n")
     assert matrix.replies[0][1].endswith("…")
+    assert matrix.replies[0][3] is not None
+    assert matrix.replies[0][3]["formatted_body"].startswith(
+        "<p><strong>Support topic</strong></p><p>"
+    )
     assert delivery_messages.created[0]["parent_delivery_message_id"] == 2
 
 
@@ -575,6 +642,15 @@ async def test_deliver_job_formats_new_topic_with_title_for_room_jobs() -> None:
     )
 
     assert result.complete is True
-    assert matrix.texts == [("!room:test", "# Support topic\n\nDetailed body")]
+    assert matrix.texts == [
+        (
+            "!room:test",
+            "# Support topic\n\nDetailed body",
+            {
+                "format": "org.matrix.custom.html",
+                "formatted_body": "<h1>Support topic</h1><p>Detailed body</p>",
+            },
+        )
+    ]
     assert matrix.notices == []
     assert matrix.replies == []

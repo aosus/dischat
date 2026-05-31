@@ -18,7 +18,7 @@ from nio import (
     SyncResponse,
 )
 
-from dischat.matrix.formatting import plain_notice, plain_text, reply_message
+from dischat.matrix.formatting import plain_notice, plain_text, reply_message, rich_text
 
 
 @dataclass(slots=True, frozen=True)
@@ -37,15 +37,32 @@ class MatrixMessage:
 
 
 class MatrixClient(Protocol):
-    async def send_text(self, room_id: str, body: str) -> MatrixSendResult: ...
+    async def send_text(
+        self,
+        room_id: str,
+        body: str,
+        *,
+        formatted: dict[str, str] | None = None,
+    ) -> MatrixSendResult: ...
 
     async def send_notice(self, room_id: str, body: str) -> MatrixSendResult: ...
 
     async def send_reply(
-        self, room_id: str, body: str, parent_event_id: str
+        self,
+        room_id: str,
+        body: str,
+        parent_event_id: str,
+        *,
+        formatted: dict[str, str] | None = None,
     ) -> MatrixSendResult: ...
 
-    async def send_dm(self, mxid: str, body: str) -> MatrixSendResult: ...
+    async def send_dm(
+        self,
+        mxid: str,
+        body: str,
+        *,
+        formatted: dict[str, str] | None = None,
+    ) -> MatrixSendResult: ...
 
 
 class NioMatrixClient:
@@ -133,17 +150,43 @@ class NioMatrixClient:
             raise ValueError(f"Matrix send_notice failed: {response}")
         return MatrixSendResult(event_id=response.event_id, room_id=room_id)
 
-    async def send_text(self, room_id: str, body: str) -> MatrixSendResult:
-        response = await self._client.room_send(room_id, "m.room.message", plain_text(body))
+    async def send_text(
+        self,
+        room_id: str,
+        body: str,
+        *,
+        formatted: dict[str, str] | None = None,
+    ) -> MatrixSendResult:
+        content = (
+            rich_text(body, formatted_body=formatted["formatted_body"])
+            if formatted is not None and "formatted_body" in formatted
+            else plain_text(body)
+        )
+        response = await self._client.room_send(room_id, "m.room.message", content)
         if not isinstance(response, RoomSendResponse):
             raise ValueError(f"Matrix send_text failed: {response}")
         return MatrixSendResult(event_id=response.event_id, room_id=room_id)
 
-    async def send_reply(self, room_id: str, body: str, parent_event_id: str) -> MatrixSendResult:
+    async def send_reply(
+        self,
+        room_id: str,
+        body: str,
+        parent_event_id: str,
+        *,
+        formatted: dict[str, str] | None = None,
+    ) -> MatrixSendResult:
         response = await self._client.room_send(
             room_id,
             "m.room.message",
-            reply_message(body, parent_event_id=parent_event_id),
+            reply_message(
+                body,
+                parent_event_id=parent_event_id,
+                formatted_body=(
+                    formatted["formatted_body"]
+                    if formatted is not None and "formatted_body" in formatted
+                    else None
+                ),
+            ),
         )
         if not isinstance(response, RoomSendResponse):
             raise ValueError(f"Matrix send_reply failed: {response}")
@@ -163,9 +206,15 @@ class NioMatrixClient:
             raise ValueError(f"Matrix room_create failed: {response}")
         return response.room_id
 
-    async def send_dm(self, mxid: str, body: str) -> MatrixSendResult:
+    async def send_dm(
+        self,
+        mxid: str,
+        body: str,
+        *,
+        formatted: dict[str, str] | None = None,
+    ) -> MatrixSendResult:
         room_id = await self.ensure_dm_room(mxid)
-        response = await self.send_text(room_id, body)
+        response = await self.send_text(room_id, body, formatted=formatted)
         return MatrixSendResult(event_id=response.event_id, room_id=room_id)
 
     async def get_event(self, *, room_id: str, event_id: str) -> dict[str, Any]:

@@ -26,13 +26,31 @@ def plain_text(body: str) -> dict[str, str]:
     }
 
 
+def rich_text(body: str, *, formatted_body: str) -> dict[str, str]:
+    return {
+        "msgtype": "m.text",
+        "body": body,
+        "format": "org.matrix.custom.html",
+        "formatted_body": formatted_body,
+    }
+
+
 def plain_notice(body: str) -> dict[str, str]:
     return {"msgtype": "m.notice", "body": body}
 
 
-def reply_message(body: str, *, parent_event_id: str) -> dict[str, object]:
+def reply_message(
+    body: str,
+    *,
+    parent_event_id: str,
+    formatted_body: str | None = None,
+) -> dict[str, object]:
     return {
-        **plain_text(body),
+        **(
+            rich_text(body, formatted_body=formatted_body)
+            if formatted_body is not None
+            else plain_text(body)
+        ),
         "m.relates_to": {
             "m.in_reply_to": {
                 "event_id": parent_event_id,

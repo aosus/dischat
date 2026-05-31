@@ -72,6 +72,13 @@ async def poll_once(
                 post_payload = dict(post_payload)
                 post_payload["category_id"] = category_id
                 post_payload["topic_title"] = topic_payload.get("title")
+                if post_payload.get("cooked") is None:
+                    for topic_post in topic_payload.get("post_stream", {}).get("posts", []):
+                        if topic_post.get("id") == post_payload.get("id"):
+                            cooked = topic_post.get("cooked")
+                            if isinstance(cooked, str):
+                                post_payload["cooked"] = cooked
+                            break
         discourse_event: DiscourseEvent = normalize_post_event(post_payload)
         if discourse_event.reply_to_post_number is not None:
             topic_payload = await client.get_topic(discourse_event.discourse_topic_id)

@@ -63,6 +63,16 @@ def render_live_post_body(post: dict[str, Any]) -> str:
     return text.strip()
 
 
+def rich_topic_body(marker: str) -> str:
+    return (
+        f"This is **bold** content for {marker}.\n\n"
+        f"Visit [AOSUS](https://aosus.org/{marker}).\n\n"
+        "- first item\n"
+        "- second item\n\n"
+        f"> quoted line for {marker}"
+    )
+
+
 async def truncate_runtime_tables(pool) -> None:
     async with pool.acquire() as connection:
         await connection.execute(
@@ -157,6 +167,80 @@ async def prepare_live_context(*, room_id: str):
         raise
 
 
+async def prepare_live_context_with_full_content(*, room_id: str, full_content: bool):
+    settings = load_settings()
+    settings.validate_runtime_requirements()
+    assert settings.discourse_test_category_id is not None
+    assert_live_test_category(settings.discourse_test_category_id, 56)
+
+    context = await build_context(settings)
+    try:
+        await context.matrix_client.login()
+        await truncate_runtime_tables(context.pool)
+
+        discourse_categories = await context.discourse_client.list_categories()
+        category_lookup = await sync_categories_from_discourse(
+            categories_repository=context.categories,
+            discourse_categories=discourse_categories,
+            live_e2e_category_id=settings.discourse_test_category_id,
+        )
+        live_probe = await context.discourse_client.get_topic(5328)
+        live_category = {
+            "id": settings.discourse_test_category_id,
+            "slug": str(
+                live_probe["category_slug"] if "category_slug" in live_probe else "testing"
+            ),
+        }
+        if live_category["slug"] not in category_lookup:
+            await context.categories.upsert_category(
+                discourse_category_id=settings.discourse_test_category_id,
+                slug=str(live_category["slug"]),
+                name=str(live_category["slug"]),
+                is_public=False,
+                enabled=True,
+            )
+            live_category_record = await context.categories.get_by_discourse_category_id(
+                settings.discourse_test_category_id
+            )
+            assert live_category_record is not None
+            category_lookup[live_category_record.slug] = live_category_record.id
+        await sync_room_links_from_file(
+            room_links_repository=context.room_links,
+            file_config=FileConfig(
+                rooms={
+                    room_id: RoomLinkConfig(
+                        categories=[str(live_category["slug"])],
+                        allow_relay=True,
+                        full_content=full_content,
+                    )
+                }
+            ),
+            category_lookup=category_lookup,
+        )
+        baseline_posts = []
+        category_topics = await context.discourse_client.list_category_latest_posts(
+            category_slug=str(live_category["slug"]),
+            category_id=settings.discourse_test_category_id,
+        )
+        for topic in category_topics:
+            topic_payload = await context.discourse_client.get_topic(int(topic["id"]))
+            baseline_posts.extend(
+                dict(topic_post, category_id=topic_payload.get("category_id"))
+                for topic_post in topic_payload.get("post_stream", {}).get("posts", [])
+            )
+        poll_state = PollerState(
+            last_seen_post_id=max((int(str(post["id"])) for post in baseline_posts), default=0)
+        )
+        live_category_record = await context.categories.get_by_discourse_category_id(
+            settings.discourse_test_category_id
+        )
+        assert live_category_record is not None
+        return context, settings, poll_state, live_category, live_category_record
+    except Exception:
+        await context.close()
+        raise
+
+
 async def wait_for_discourse_reply(*, client, topic_id: int, raw: str, username: str):
     async def poll_reply() -> dict[str, Any] | None:
         topic = await client.get_topic(topic_id)
@@ -204,7 +288,7 @@ async def test_live_room_relay_roundtrip() -> None:
 
         marker = uuid4().hex[:12]
         topic_title = f"Live relay room {marker}"
-        topic_body = f"live relay room body {marker}"
+        topic_body = rich_topic_body(marker)
         topic = await context.discourse_client.create_topic(
             title=topic_title,
             raw=topic_body,
@@ -237,6 +321,14 @@ async def test_live_room_relay_roundtrip() -> None:
             event_id=room_mapping.matrix_event_id,
         )
         assert marker in str(bridged_event.get("content", {}).get("body", ""))
+        content = bridged_event.get("content", {})
+        assert content.get("format") == "org.matrix.custom.html"
+        formatted_body = str(content.get("formatted_body", ""))
+        assert f"<h1>{topic_title}</h1>" in formatted_body
+        assert f"<strong>bold</strong> content for {marker}" in formatted_body
+        assert f'href="https://aosus.org/{marker}"' in formatted_body
+        assert "<ul>" in formatted_body
+        assert "<blockquote>" in formatted_body
 
         reply_body = f"live relay response {marker}"
         reply_send = await user_client.send_reply(
@@ -307,7 +399,7 @@ async def test_live_category_watch_delivers_dm() -> None:
         )
 
         marker = uuid4().hex[:12]
-        topic_body = f"live watch dm body {marker} and enough text for discourse"
+        topic_body = rich_topic_body(marker)
         topic = await context.discourse_client.create_topic(
             title=f"Live watch dm {marker}",
             raw=topic_body,
@@ -345,5 +437,77 @@ async def test_live_category_watch_delivers_dm() -> None:
         )
         assert dm_mapping.matrix_room_id != env.matrix_test_room_id
         assert marker in str(dm_event.get("content", {}).get("body", ""))
+        assert dm_event.get("content", {}).get("format") == "org.matrix.custom.html"
+        formatted_body = str(dm_event.get("content", {}).get("formatted_body", ""))
+        assert f"<strong>bold</strong> content for {marker}" in formatted_body
+        assert f'href="https://aosus.org/{marker}"' in formatted_body
+    finally:
+        await context.close()
+
+
+@pytest.mark.asyncio
+async def test_live_room_relay_excerpt_uses_bold_title_and_excerpt_html() -> None:
+    env = load_live_env()
+    (
+        context,
+        settings,
+        poll_state,
+        _live_category,
+        _live_category_record,
+    ) = await prepare_live_context_with_full_content(
+        room_id=env.matrix_test_room_id,
+        full_content=False,
+    )
+
+    try:
+        marker = uuid4().hex[:12]
+        topic_title = f"Live excerpt room {marker}"
+        topic_body = (
+            rich_topic_body(marker)
+            + "\n\n"
+            + "This second paragraph makes the post long enough to exceed the room excerpt limit. "
+            + "This third sentence keeps the rendered event clearly in excerpt mode for the live check. "
+            + "This fourth sentence adds extra length so the collapsed plain-text body is guaranteed to be truncated."
+        )
+        topic = await context.discourse_client.create_topic(
+            title=topic_title,
+            raw=topic_body,
+            category_id=settings.discourse_test_category_id,
+        )
+
+        processed = await poll_once(
+            client=context.discourse_client,
+            state=poll_state,
+            categories=context.categories,
+            discourse_events=context.discourse_events,
+            room_links=context.room_links,
+            chat_accounts=context.chat_accounts,
+            user_watches=context.user_watches,
+            delivery_messages=context.delivery_messages,
+            delivery_jobs=context.delivery_jobs,
+            live_e2e_category_id=settings.discourse_test_category_id,
+        )
+        assert processed >= 1
+        delivered = await drain_delivery_jobs(context)
+        assert delivered >= 1
+
+        room_mapping = await context.delivery_messages.get_by_discourse_post_and_room(
+            discourse_post_id=topic.post_id,
+            matrix_room_id=env.matrix_test_room_id,
+        )
+        assert room_mapping is not None
+        bridged_event = await context.matrix_client.get_event(
+            room_id=env.matrix_test_room_id,
+            event_id=room_mapping.matrix_event_id,
+        )
+        content = bridged_event.get("content", {})
+        body = str(content.get("body", ""))
+        formatted_body = str(content.get("formatted_body", ""))
+
+        assert content.get("format") == "org.matrix.custom.html"
+        assert body.startswith(f"# {topic_title}\n\n")
+        assert body.endswith("…")
+        assert f"<strong>{topic_title}</strong>" in formatted_body
+        assert "<h1>" not in formatted_body
     finally:
         await context.close()
