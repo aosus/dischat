@@ -5,15 +5,15 @@ from typing import Any, Protocol, cast
 
 import httpx
 
-from dischat.discourse.client import DiscourseWriteResult
 from dischat.i18n import translate
-from dischat.matrix.client import MatrixClient, MatrixMessage, MatrixSendResult
+from dischat.matrix.client import MatrixMessage, MatrixSendResult
 from dischat.security.audit import AuditEntry
 from dischat.security.permissions import can_post_from_chat, detect_platform
 from dischat.storage.repositories import (
     ChatAccount,
     DeliveryMessageRecord,
     RoomLinkRecord,
+    TargetType,
 )
 
 
@@ -26,10 +26,13 @@ class BridgeResult:
     matrix_response: MatrixSendResult | None = None
 
 
+class DiscourseReplyResult(Protocol):
+    topic_id: int
+    post_id: int
+
+
 class DiscourseReplyWriter(Protocol):
     async def get_post(self, post_id: int) -> dict[str, object]: ...
-
-    async def get_topic(self, topic_id: int) -> dict[str, object]: ...
 
     async def create_reply(
         self,
@@ -38,7 +41,11 @@ class DiscourseReplyWriter(Protocol):
         raw: str,
         reply_to_post_number: int | None = None,
         api_username: str | None = None,
-    ) -> DiscourseWriteResult: ...
+    ) -> DiscourseReplyResult: ...
+
+
+class DiscourseTopicReader(Protocol):
+    async def get_topic(self, topic_id: int) -> dict[str, object]: ...
 
 
 class ChatAccountsRepo(Protocol):
@@ -66,7 +73,7 @@ class DeliveryMessagesRepo(Protocol):
         discourse_post_id: int,
         matrix_room_id: str,
         matrix_event_id: str,
-        target_type: str,
+        target_type: TargetType,
         target_mxid: str | None,
         parent_delivery_message_id: int | None,
     ) -> DeliveryMessageRecord: ...
@@ -74,6 +81,10 @@ class DeliveryMessagesRepo(Protocol):
 
 class AuditLogsRepo(Protocol):
     async def record(self, entry: AuditEntry) -> None: ...
+
+
+class MatrixNoticeClient(Protocol):
+    async def send_notice(self, room_id: str, body: str) -> MatrixSendResult: ...
 
 
 def relay_username_for_platform(*, platform: str, matrix: str, telegram: str, discord: str) -> str:
@@ -88,7 +99,7 @@ async def handle_matrix_reply(
     *,
     message: MatrixMessage,
     discourse_client: DiscourseReplyWriter,
-    matrix_client: MatrixClient,
+    matrix_client: MatrixNoticeClient,
     chat_accounts: ChatAccountsRepo,
     room_links: RoomLinksRepo,
     delivery_messages: DeliveryMessagesRepo,
@@ -144,18 +155,21 @@ async def handle_matrix_reply(
         parent_post = {}
     reply_to_post_number = parent_post.get("post_number")
     if not isinstance(reply_to_post_number, int):
-        topic_payload = await discourse_client.get_topic(parent.discourse_topic_id)
-        post_stream = topic_payload.get("post_stream")
-        topic_posts: list[dict[str, Any]] = []
-        if isinstance(post_stream, dict):
-            post_stream_dict = cast("dict[str, Any]", post_stream)
-            posts = post_stream_dict.get("posts")
-            if isinstance(posts, list):
-                topic_posts = [post for post in posts if isinstance(post, dict)]
-        for topic_post in topic_posts:
-            if topic_post.get("id") == parent.discourse_post_id:
-                reply_to_post_number = topic_post.get("post_number")
-                break
+        if hasattr(discourse_client, "get_topic"):
+            topic_payload = await cast("DiscourseTopicReader", discourse_client).get_topic(
+                parent.discourse_topic_id
+            )
+            post_stream = topic_payload.get("post_stream")
+            topic_posts: list[dict[str, Any]] = []
+            if isinstance(post_stream, dict):
+                post_stream_dict = cast("dict[str, Any]", post_stream)
+                posts = post_stream_dict.get("posts")
+                if isinstance(posts, list):
+                    topic_posts = [post for post in posts if isinstance(post, dict)]
+            for topic_post in topic_posts:
+                if topic_post.get("id") == parent.discourse_post_id:
+                    reply_to_post_number = topic_post.get("post_number")
+                    break
     if not isinstance(reply_to_post_number, int):
         response = await matrix_client.send_notice(
             message.room_id,
@@ -165,7 +179,7 @@ async def handle_matrix_reply(
             posted=False, error_message="missing_parent_post_number", matrix_response=response
         )
 
-    write_result: DiscourseWriteResult = await discourse_client.create_reply(
+    write_result = await discourse_client.create_reply(
         topic_id=parent.discourse_topic_id,
         raw=message.body,
         reply_to_post_number=reply_to_post_number,

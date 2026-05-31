@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Any, Protocol
 
 from dischat.discourse.formatting import (
     excerpt_text,
@@ -12,11 +13,11 @@ from dischat.discourse.formatting import (
 from dischat.i18n import translate
 from dischat.matrix.client import MatrixClient
 from dischat.storage.repositories import (
-    ChatAccountRepository,
+    ChatAccount,
     DeliveryJobRecord,
-    DeliveryMessageRepository,
-    DiscourseEventRepository,
-    RoomLinkRepository,
+    DeliveryMessageRecord,
+    RoomLinkRecord,
+    TargetType,
 )
 
 
@@ -24,6 +25,42 @@ from dischat.storage.repositories import (
 class WorkerResult:
     complete: bool
     error: str | None = None
+
+
+class StoredEvent(Protocol):
+    discourse_topic_id: int
+    discourse_post_id: int
+    raw_payload_json: dict[str, Any]
+
+
+class DiscourseEventsRepo(Protocol):
+    async def get_by_id(self, event_id: int) -> StoredEvent | None: ...
+
+
+class DeliveryMessagesRepo(Protocol):
+    async def get_by_discourse_post_and_room(
+        self, *, discourse_post_id: int, matrix_room_id: str
+    ) -> DeliveryMessageRecord | None: ...
+
+    async def create_mapping(
+        self,
+        *,
+        discourse_topic_id: int,
+        discourse_post_id: int,
+        matrix_room_id: str,
+        matrix_event_id: str,
+        target_type: TargetType,
+        target_mxid: str | None,
+        parent_delivery_message_id: int | None,
+    ) -> DeliveryMessageRecord: ...
+
+
+class ChatAccountsRepo(Protocol):
+    async def get_by_mxid(self, mxid: str) -> ChatAccount | None: ...
+
+
+class RoomLinksRepo(Protocol):
+    async def get_by_room_id(self, matrix_room_id: str) -> RoomLinkRecord | None: ...
 
 
 def _render_discourse_body(payload: dict[str, object]) -> str:
@@ -72,10 +109,10 @@ def _render_delivery_content(
 async def deliver_job(
     *,
     job: DeliveryJobRecord,
-    discourse_events: DiscourseEventRepository,
-    delivery_messages: DeliveryMessageRepository,
-    chat_accounts: ChatAccountRepository,
-    room_links: RoomLinkRepository,
+    discourse_events: DiscourseEventsRepo,
+    delivery_messages: DeliveryMessagesRepo,
+    chat_accounts: ChatAccountsRepo,
+    room_links: RoomLinksRepo,
     matrix_client: MatrixClient,
 ) -> WorkerResult:
     event = await discourse_events.get_by_id(job.event_id)

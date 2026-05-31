@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import Any
 
 from dischat.discourse.sync import PollerState
 from dischat.main import drain_delivery_jobs, run_iteration
@@ -8,7 +9,7 @@ from dischat.storage.repositories import DeliveryJobRecord
 
 class FakeMatrixClient:
     def __init__(self) -> None:
-        self.sync_calls: list[dict[str, object]] = []
+        self.sync_calls: list[dict[str, Any]] = []
         self.accepted: list[object] = []
 
     async def sync_once(self, *, since: str | None = None, timeout_ms: int = 0):
@@ -85,8 +86,8 @@ async def test_drain_delivery_jobs_marks_completed_and_failed(monkeypatch) -> No
 
 
 async def test_run_iteration_syncs_processes_and_returns_next_batch(monkeypatch) -> None:
-    process_calls: list[dict[str, object]] = []
-    poll_calls: list[dict[str, object]] = []
+    process_calls: list[dict[str, Any]] = []
+    poll_calls: list[dict[str, Any]] = []
     drain_calls: list[object] = []
 
     async def fake_process_sync_messages(**kwargs) -> None:

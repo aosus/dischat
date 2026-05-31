@@ -1,13 +1,43 @@
 from __future__ import annotations
 
+from typing import Protocol
+
 from dischat.discourse.models import DiscourseEvent
 from dischat.storage.repositories import (
-    ChatAccountRepository,
-    DeliveryJobRepository,
-    DeliveryMessageRepository,
-    RoomLinkRepository,
-    UserWatchRepository,
+    ChatAccount,
+    DeliveryMessageRecord,
+    RoomLinkRecord,
+    TargetType,
 )
+
+
+class RoomLinksRepo(Protocol):
+    async def list_links_matching_category(self, category_slug: str) -> list[RoomLinkRecord]: ...
+
+
+class ChatAccountsRepo(Protocol):
+    async def list_by_discourse_username(self, discourse_username: str) -> list[ChatAccount]: ...
+
+
+class UserWatchesRepo(Protocol):
+    async def list_mxids_for_category(self, *, category_id: int) -> list[str]: ...
+
+
+class DeliveryMessagesRepo(Protocol):
+    async def list_by_discourse_post(
+        self, *, discourse_post_id: int
+    ) -> list[DeliveryMessageRecord]: ...
+
+
+class DeliveryJobsRepo(Protocol):
+    async def enqueue(
+        self,
+        *,
+        event_id: int,
+        target_type: TargetType,
+        target_mxid: str | None,
+        matrix_room_id: str | None,
+    ) -> None: ...
 
 
 async def route_event(
@@ -16,11 +46,11 @@ async def route_event(
     discourse_event: DiscourseEvent,
     category_slug: str | None,
     category_id: int | None,
-    room_links: RoomLinkRepository,
-    chat_accounts: ChatAccountRepository,
-    user_watches: UserWatchRepository,
-    delivery_messages: DeliveryMessageRepository,
-    delivery_jobs: DeliveryJobRepository,
+    room_links: RoomLinksRepo,
+    chat_accounts: ChatAccountsRepo,
+    user_watches: UserWatchesRepo,
+    delivery_messages: DeliveryMessagesRepo,
+    delivery_jobs: DeliveryJobsRepo,
 ) -> None:
     if category_slug is not None and discourse_event.event_type == "new_topic":
         for room_link in await room_links.list_links_matching_category(category_slug):

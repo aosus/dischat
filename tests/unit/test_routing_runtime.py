@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Any
 
 from dischat.bridge import handle_matrix_reply
 from dischat.discourse.models import DiscourseEvent
@@ -12,6 +13,7 @@ from dischat.storage.repositories import (
     DeliveryJobRecord,
     DeliveryMessageRecord,
     RoomLinkRecord,
+    TargetType,
 )
 
 
@@ -25,7 +27,7 @@ class FakeDiscourseWriteResult:
 
 class FakeDiscourseClient:
     def __init__(self) -> None:
-        self.calls: list[dict[str, object]] = []
+        self.calls: list[dict[str, Any]] = []
         self.latest_posts: list[dict[str, object]] = []
         self.topics: dict[int, dict[str, object]] = {}
         self.posts: dict[int, dict[str, object]] = {}
@@ -167,7 +169,7 @@ class FakeDeliveryMessages:
         discourse_post_id: int,
         matrix_room_id: str,
         matrix_event_id: str,
-        target_type: str,
+        target_type: TargetType,
         target_mxid: str | None,
         parent_delivery_message_id: int | None,
     ) -> DeliveryMessageRecord:
@@ -232,7 +234,7 @@ class FakeDeliveryJobs:
         self,
         *,
         event_id: int,
-        target_type: str,
+        target_type: TargetType,
         target_mxid: str | None,
         matrix_room_id: str | None,
     ) -> None:
@@ -248,7 +250,7 @@ class FakeDeliveryJobs:
 
 class FakeCategories:
     def __init__(self) -> None:
-        self.categories: dict[int, object] = {}
+        self.categories: dict[int, Any] = {}
 
     async def get_by_discourse_category_id(self, discourse_category_id: int):
         return self.categories.get(discourse_category_id)
@@ -256,9 +258,9 @@ class FakeCategories:
 
 class FakeDiscourseEvents:
     def __init__(self) -> None:
-        self.created: list[dict[str, object]] = []
+        self.created: list[dict[str, Any]] = []
         self.event = None
-        self.by_id: dict[int, object] = {}
+        self.by_id: dict[int, Any] = {}
 
     async def create_event_if_missing(self, **kwargs):
         self.created.append(kwargs)

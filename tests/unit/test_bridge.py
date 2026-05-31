@@ -1,9 +1,15 @@
 from dataclasses import dataclass
+from typing import Any
 
 from dischat.bridge import handle_matrix_reply
 from dischat.matrix.client import MatrixMessage, MatrixSendResult
 from dischat.security.audit import AuditEntry
-from dischat.storage.repositories import ChatAccount, DeliveryMessageRecord, RoomLinkRecord
+from dischat.storage.repositories import (
+    ChatAccount,
+    DeliveryMessageRecord,
+    RoomLinkRecord,
+    TargetType,
+)
 
 
 @dataclass(slots=True)
@@ -16,7 +22,7 @@ class FakeDiscourseWriteResult:
 
 class FakeDiscourseClient:
     def __init__(self) -> None:
-        self.calls: list[dict[str, object]] = []
+        self.calls: list[dict[str, Any]] = []
 
     async def get_post(self, post_id: int) -> dict[str, object]:
         return {"post_number": 2}
@@ -113,7 +119,7 @@ class FakeDeliveryMessages:
         discourse_post_id: int,
         matrix_room_id: str,
         matrix_event_id: str,
-        target_type: str,
+        target_type: TargetType,
         target_mxid: str | None,
         parent_delivery_message_id: int | None,
     ) -> DeliveryMessageRecord:
