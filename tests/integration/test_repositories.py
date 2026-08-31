@@ -186,3 +186,92 @@ async def test_audit_logs_are_persisted(pg_pool) -> None:
         count = await connection.fetchval("SELECT COUNT(*) FROM audit_logs")
 
     assert count == 1
+
+
+async def test_watch_queries_exclude_non_public_and_disabled_categories(pg_pool) -> None:
+    categories = CategoryRepository(pg_pool)
+    watches = UserWatchRepository(pg_pool)
+
+    public = await categories.upsert_category(
+        discourse_category_id=10, slug="public", name="Public", is_public=True
+    )
+    private = await categories.upsert_category(
+        discourse_category_id=99, slug="private", name="Private", is_public=False
+    )
+    disabled = await categories.upsert_category(
+        discourse_category_id=50,
+        slug="disabled",
+        name="Disabled",
+        is_public=True,
+        enabled=False,
+    )
+
+    await watches.add_category_watch(mxid="@specific:aosus.org", category_id=public.id)
+    await watches.add_category_watch(mxid="@private-watcher:aosus.org", category_id=private.id)
+    await watches.add_category_watch(mxid="@disabled-watcher:aosus.org", category_id=disabled.id)
+    await watches.add_watch_all(mxid="@all:aosus.org")
+
+    # Public category: specific watch plus all_public_categories watch.
+    assert await watches.list_mxids_for_category(category_id=public.id) == [
+        "@all:aosus.org",
+        "@specific:aosus.org",
+    ]
+    # Unknown category matches nothing.
+    assert await watches.list_mxids_for_category(category_id=424242) == []
+    # Non-public and disabled categories are excluded by default (defense in depth), even
+    # though a specific category watch row exists.
+    assert await watches.list_mxids_for_category(category_id=private.id) == []
+    assert await watches.list_mxids_for_category(category_id=disabled.id) == []
+    # The live-E2E escape hatch is explicit but narrow: it unlocks only the explicit
+    # category watch; all_public_categories subscribers must never see a non-public
+    # category through it.
+    assert await watches.list_mxids_for_category(
+        category_id=private.id, include_non_public=True
+    ) == ["@private-watcher:aosus.org"]
+
+
+async def test_room_link_matching_excludes_non_public_and_disabled_categories(pg_pool) -> None:
+    categories = CategoryRepository(pg_pool)
+    room_links = RoomLinkRepository(pg_pool)
+
+    public = await categories.upsert_category(
+        discourse_category_id=10, slug="public", name="Public", is_public=True
+    )
+    private = await categories.upsert_category(
+        discourse_category_id=99, slug="private", name="Private", is_public=False
+    )
+    disabled = await categories.upsert_category(
+        discourse_category_id=50,
+        slug="disabled",
+        name="Disabled",
+        is_public=True,
+        enabled=False,
+    )
+
+    await room_links.replace_room_links(
+        {
+            "!room:test": {"categories": ["private"], "allow_relay": False, "full_content": True},
+            "!room:all": {"categories": ["all"], "allow_relay": False, "full_content": True},
+        },
+        {
+            slug: record.id
+            for slug, record in [("public", public), ("private", private), ("disabled", disabled)]
+        },
+    )
+
+    # Public category still matches the all-public-categories room link only.
+    public_matches = await room_links.list_links_matching_category("public")
+    assert [match.matrix_room_id for match in public_matches] == ["!room:all"]
+
+    # Non-public and disabled slugs match nothing by default.
+    assert await room_links.list_links_matching_category("private") == []
+    assert await room_links.list_links_matching_category("disabled") == []
+    assert await room_links.list_links_matching_category("unknown") == []
+
+    # The live-E2E escape hatch is explicit but narrow: it matches only the explicitly
+    # linked room; include_all_public_categories rooms must never see a non-public
+    # category through it.
+    non_public_matches = await room_links.list_links_matching_category(
+        "private", include_non_public=True
+    )
+    assert [match.matrix_room_id for match in non_public_matches] == ["!room:test"]

@@ -1,31 +1,70 @@
-from dischat.subscriptions.categories import Category, filter_watchable_categories
-from dischat.subscriptions.service import UserWatch, is_category_watched
+from types import SimpleNamespace
+from typing import Any
+
+from dischat.subscriptions.bootstrap import sync_categories_from_discourse
 
 
-def test_filter_watchable_categories_ignores_private_categories_in_production() -> None:
-    categories = [
-        Category(discourse_category_id=1, slug="public", name="Public", is_public=True),
-        Category(discourse_category_id=56, slug="private", name="Private", is_public=False),
+class FakeCategoryRepository:
+    def __init__(self) -> None:
+        self.upserts: list[dict[str, object]] = []
+        self.disable_calls: list[list[int]] = []
+
+    async def upsert_category(
+        self,
+        *,
+        discourse_category_id: int,
+        slug: str,
+        name: str,
+        is_public: bool,
+        enabled: bool = True,
+    ) -> Any:
+        self.upserts.append(
+            {
+                "discourse_category_id": discourse_category_id,
+                "slug": slug,
+                "name": name,
+                "is_public": is_public,
+                "enabled": enabled,
+            }
+        )
+        return SimpleNamespace(id=len(self.upserts), slug=slug)
+
+    async def disable_categories_not_in(self, discourse_category_ids: list[int]) -> None:
+        self.disable_calls.append(discourse_category_ids)
+
+
+async def test_sync_categories_disables_missing_categories_in_production() -> None:
+    repository = FakeCategoryRepository()
+    discourse_categories: list[dict[str, object]] = [
+        {"id": 10, "slug": "support", "name": "Support", "read_restricted": False},
+        {"id": 99, "slug": "private", "name": "Private", "read_restricted": True},
     ]
 
-    result = filter_watchable_categories(categories)
+    await sync_categories_from_discourse(
+        categories_repository=repository,
+        discourse_categories=discourse_categories,
+        live_e2e_category_id=None,
+    )
 
-    assert [category.slug for category in result] == ["public"]
+    disable_calls = repository.disable_calls
+    assert disable_calls == [[10, 99]]
+    private = next(call for call in repository.upserts if call["discourse_category_id"] == 99)
+    assert private["is_public"] is False
+    assert private["enabled"] is False
 
 
-def test_filter_watchable_categories_only_returns_live_test_category() -> None:
-    categories = [
-        Category(discourse_category_id=1, slug="public", name="Public", is_public=True),
-        Category(discourse_category_id=56, slug="private", name="Private", is_public=False),
+async def test_sync_categories_skips_disable_pass_in_live_e2e_mode() -> None:
+    repository = FakeCategoryRepository()
+    discourse_categories: list[dict[str, object]] = [
+        {"id": 56, "slug": "testing", "name": "Testing", "read_restricted": True},
     ]
 
-    result = filter_watchable_categories(categories, live_e2e_category_id=56)
+    await sync_categories_from_discourse(
+        categories_repository=repository,
+        discourse_categories=discourse_categories,
+        live_e2e_category_id=56,
+    )
 
-    assert [category.slug for category in result] == ["private"]
-
-
-def test_category_watch_matches_specific_slug() -> None:
-    category = Category(discourse_category_id=1, slug="support", name="Support", is_public=True)
-    watches = [UserWatch(mxid="@alice:aosus.org", mode="category", category_slug="support")]
-
-    assert is_category_watched(watches, category) is True
+    assert repository.disable_calls == []
+    assert len(repository.upserts) == 1
+    assert repository.upserts[0]["enabled"] is True

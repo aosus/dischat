@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
 
@@ -13,6 +14,8 @@ from dischat.discourse.router import (
     UserWatchesRepo,
     route_event,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class DiscourseClientLike(Protocol):
@@ -30,6 +33,8 @@ class CategoryFeedClient(Protocol):
 class CategoryRef(Protocol):
     id: int
     slug: str
+    is_public: bool
+    enabled: bool
 
 
 class CategoriesRepo(Protocol):
@@ -59,6 +64,11 @@ class DiscourseEventsRepo(Protocol):
 @dataclass(slots=True)
 class PollerState:
     last_seen_post_id: int | None = None
+    # Set when the pre-poll visibility revalidation failed: the stored snapshot can no
+    # longer be trusted as proof that a category is public, so polling must not evaluate
+    # posts. Visibility itself is revalidated before every poll; this flag only records
+    # the failed-attempt state until the next attempt succeeds.
+    visibility_stale: bool = False
 
 
 def _topic_posts(topic_payload: dict[str, object]) -> list[dict[str, object]]:
@@ -84,7 +94,24 @@ async def poll_once(
     delivery_messages: DeliveryMessagesRepo,
     delivery_jobs: DeliveryJobsRepo,
     live_e2e_category_id: int | None = None,
+    visibility_stale: bool = False,
 ) -> int:
+    # Fail-closed gate (polling boundary): when the pre-poll visibility revalidation
+    # failed, the stored `is_public`/`enabled` flags no longer prove a category is still
+    # public (an admin may have restricted it since the last successful refresh, while
+    # the admin-key post feed keeps working). Rather than route on possibly outdated
+    # visibility, skip the entire poll — nothing is read as "skipped content",
+    # `last_seen_post_id` does not advance, and the same posts are re-evaluated against a
+    # fresh snapshot once visibility is revalidated. `run_iteration` retries the
+    # revalidation on every iteration while this flag is set. The live-E2E category is
+    # exempt: it is already isolated to live-E2E mode by its exact ID and never consults
+    # this snapshot.
+    if (visibility_stale or state.visibility_stale) and live_e2e_category_id is None:
+        logger.warning(
+            "Skipping Discourse poll: category visibility snapshot is stale "
+            "(refresh failed); no content will be routed until visibility is revalidated"
+        )
+        return 0
     if live_e2e_category_id is not None:
         live_category = await categories.get_by_discourse_category_id(live_e2e_category_id)
         if live_category is None:
@@ -128,6 +155,32 @@ async def poll_once(
                             if isinstance(cooked, str):
                                 post_payload["cooked"] = cooked
                             break
+        # Category gate (polling boundary): resolve the post's category against the bootstrap
+        # record *before* any event or delivery job is created. The Discourse client runs with
+        # an admin API key, so what the API returns must never be trusted here; only the stored
+        # `is_public`/`enabled` flags decide visibility. Unknown, disabled, and non-public
+        # categories are skipped entirely. The one exception is the explicit live-E2E category,
+        # isolated to live-E2E mode by its exact discourse category ID.
+        raw_category_id = post_payload.get("category_id")
+        discourse_category_id: int | None = None
+        if isinstance(raw_category_id, int | str):
+            discourse_category_id = int(raw_category_id)
+        include_non_public_category = False
+        if discourse_category_id is None and live_e2e_category_id is not None:
+            # Live-E2E mode reads a single category feed; tolerate payloads missing category_id.
+            discourse_category_id = live_e2e_category_id
+        if discourse_category_id is None:
+            continue
+        if live_e2e_category_id is not None and discourse_category_id == live_e2e_category_id:
+            include_non_public_category = True
+        else:
+            category_record = await categories.get_by_discourse_category_id(discourse_category_id)
+            if (
+                category_record is None
+                or not category_record.enabled
+                or not category_record.is_public
+            ):
+                continue
         discourse_event: DiscourseEvent = normalize_post_event(post_payload)
         if discourse_event.reply_to_post_number is not None:
             topic_payload = await client.get_topic(discourse_event.discourse_topic_id)
@@ -165,6 +218,7 @@ async def poll_once(
             user_watches=user_watches,
             delivery_messages=delivery_messages,
             delivery_jobs=delivery_jobs,
+            include_non_public_category=include_non_public_category,
         )
         state.last_seen_post_id = post_id
         processed += 1
