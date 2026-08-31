@@ -4,6 +4,19 @@ Dischat bridges public Discourse activity into Matrix rooms and Matrix direct me
 
 The service is designed to run continuously: it long-polls Matrix for inbound messages, polls Discourse for new posts, and drains a PostgreSQL-backed delivery queue.
 
+## Deployment
+
+For single-host deployments use the bundled Docker Compose stack: PostgreSQL data is persisted in the named volume `postgres-data`, services auto-restart (`restart: unless-stopped`), and the database has a healthcheck.
+
+Before going to production:
+
+1. set a strong `POSTGRES_PASSWORD` in `.env` (git-ignored; the example `dischat/dischat` credentials are development-only);
+2. take regular backups with `docker compose exec -T postgres pg_dump -U dischat -d dischat > backup.sql`.
+
+See [Docker deployment](docs/docker.md) for the full production path (bundled vs external database) and [backup/restore commands](docs/docker.md#data-persistence-backups).
+
+## Development
+
 The repository is built around:
 
 - `uv` for environment and dependency management
