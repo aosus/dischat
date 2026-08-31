@@ -255,24 +255,36 @@ async def test_migration_0007_reclassifies_stale_pending_success_rows(pg_pool) -
         / "0007_audit_pending_success_nullable.sql"
     )
     async with pg_pool.acquire() as connection:
-        await connection.execute(
-            """
-            INSERT INTO audit_logs (action, discourse_username_used, success, status)
-            VALUES ('deliver_matrix_room_message', 'system', TRUE, 'pending')
-            """
-        )
+        # The fixture has already applied migration 0008, whose integrity
+        # constraint correctly rejects this legacy-invalid state. Recreate
+        # the pre-0008 schema inside a transaction so 0007's data backfill can
+        # be tested without weakening the schema for subsequent tests.
+        transaction = connection.transaction()
+        await transaction.start()
+        try:
+            await connection.execute(
+                "ALTER TABLE audit_logs DROP CONSTRAINT audit_logs_outcome_consistent"
+            )
+            await connection.execute(
+                """
+                INSERT INTO audit_logs (action, discourse_username_used, success, status)
+                VALUES ('deliver_matrix_room_message', 'system', TRUE, 'pending')
+                """
+            )
 
-        await connection.execute(migration_path.read_text(encoding="utf-8"))
+            await connection.execute(migration_path.read_text(encoding="utf-8"))
 
-        row = await connection.fetchrow(
-            """
-            SELECT success, status
-            FROM audit_logs
-            WHERE status = 'pending'
-            ORDER BY id DESC
-            LIMIT 1
-            """
-        )
+            row = await connection.fetchrow(
+                """
+                SELECT success, status
+                FROM audit_logs
+                WHERE status = 'pending'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            )
+        finally:
+            await transaction.rollback()
 
     assert row is not None
     assert row["status"] == "pending"

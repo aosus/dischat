@@ -534,7 +534,7 @@ async def test_sync_token_survives_restart(pg_pool) -> None:
             return []
 
     class _NoopJobs:
-        async def claim_next_job(self):
+        async def claim_next_job(self, *, lease_seconds: int):
             return None
 
     first_context = SimpleNamespace(
@@ -1167,7 +1167,10 @@ async def test_two_concurrent_handlers_produce_exactly_one_discourse_write(pg_po
     # B sees the same event while A holds a fresh, unexpired lease mid-write.
     second = await task_b
     assert second.posted is False
-    assert second.error_message == "event_already_claimed"
+    # A has already entered the non-replayable external-write region. From
+    # another handler's perspective the remote outcome is therefore
+    # ambiguous until A records it, so the durable fence fails closed.
+    assert second.error_message == "event_write_ambiguous"
     assert len(replayed.calls) == 0
 
     # A finishes its single write.
