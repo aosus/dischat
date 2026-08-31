@@ -64,6 +64,7 @@ async def build_context(settings: Settings) -> AppContext:
         user_id=settings.matrix_bot_mxid,
         access_token=settings.matrix_access_token,
         password=settings.matrix_bot_password,
+        device_id=settings.matrix_device_id,
     )
     chat_accounts = ChatAccountRepository(pool)
     pairing_sessions = PairingSessionRepository(pool)

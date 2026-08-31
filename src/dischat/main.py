@@ -10,6 +10,7 @@ from dischat.logging import configure_logging
 from dischat.matrix.handler import process_sync_messages
 from dischat.runtime import build_context
 from dischat.service import backoff_delay
+from dischat.storage.repositories import DEFAULT_JOB_LEASE_SECONDS
 from dischat.subscriptions.bootstrap import (
     sync_categories_from_discourse,
     sync_room_links_from_file,
@@ -17,30 +18,72 @@ from dischat.subscriptions.bootstrap import (
 
 logger = logging.getLogger(__name__)
 
+def _job_lease_seconds(context) -> int:
+    """Lease duration for claimed jobs, configurable via DELIVERY_JOB_LEASE_SECONDS."""
+    settings = getattr(context, "settings", None)
+    configured = getattr(settings, "delivery_job_lease_seconds", DEFAULT_JOB_LEASE_SECONDS)
+    return int(configured)
 
 async def drain_delivery_jobs(context) -> int:
     delivered = 0
+    lease_seconds = _job_lease_seconds(context)
     while True:
-        job = await context.delivery_jobs.claim_next_job()
+        job = await context.delivery_jobs.claim_next_job(lease_seconds=lease_seconds)
         if job is None:
             return delivered
-        result = await deliver_job(
-            job=job,
-            discourse_events=context.discourse_events,
-            delivery_messages=context.delivery_messages,
-            chat_accounts=context.chat_accounts,
-            room_links=context.room_links,
-            matrix_client=context.matrix_client,
-        )
-        if result.complete:
-            await context.delivery_jobs.mark_complete(job.id)
-            delivered += 1
+        try:
+            result = await deliver_job(
+                job=job,
+                discourse_events=context.discourse_events,
+                delivery_messages=context.delivery_messages,
+                chat_accounts=context.chat_accounts,
+                room_links=context.room_links,
+                matrix_client=context.matrix_client,
+                delivery_jobs=context.delivery_jobs,
+            )
+        except asyncio.CancelledError:
+            # Shutdown: leave the lease to expire so another worker reclaims the job.
+            raise
+        except Exception as exc:
+            # A raising delivery must never strand the job in 'running': move it to a
+            # retryable 'failed' state with the error text and a backoff. If persisting
+            # the failure itself fails, the job keeps its (still-expiring) lease and is
+            # reclaimed after restart — see docs/operations.md. mark_failed is fenced
+            # on the claim token: if our lease expired and the job was reclaimed, the
+            # stale update is ignored.
+            logger.warning("Delivery job %s raised: %s", job.id, exc)
+            await context.delivery_jobs.mark_failed(
+                job.id,
+                claim_token=job.claim_token or "",
+                error=f"{exc.__class__.__name__}: {exc}",
+                next_attempt_at=backoff_delay(job.attempts),
+            )
             continue
-        await context.delivery_jobs.mark_failed(
+        if result.complete:
+            fenced = await context.delivery_jobs.mark_complete(
+                job.id, claim_token=job.claim_token or ""
+            )
+            if fenced:
+                delivered += 1
+            else:
+                logger.info(
+                    "Delivery job %s completed but its claim was lost; "
+                    "leaving the newer claim in charge",
+                    job.id,
+                )
+            continue
+        logger.info("Delivery job %s failed: %s", job.id, result.error)
+        fenced = await context.delivery_jobs.mark_failed(
             job.id,
+            claim_token=job.claim_token or "",
             error=result.error or "unknown_error",
             next_attempt_at=backoff_delay(job.attempts),
         )
+        if not fenced:
+            logger.info(
+                "Delivery job %s failed but its claim was lost; leaving the newer claim in charge",
+                job.id,
+            )
 
 
 async def refresh_category_visibility(*, context, settings, poll_state: PollerState) -> bool:
