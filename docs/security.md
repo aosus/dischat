@@ -95,11 +95,62 @@ revalidation must never leave the last-known snapshot in charge:
   delivery of already-enqueued jobs are unaffected by the suspension. The live-E2E test
   category is exempt, since it never consults the visibility snapshot.
 
-## Still to complete in runtime code
-
-- audit persistence for every live write path
-
 Deployment secrets hygiene:
 
 - the example `dischat/dischat` database credentials in `docker-compose.yml` are development-only; set a strong `POSTGRES_PASSWORD` in `.env` (git-ignored) before any real deployment
 - the bundled PostgreSQL data volume (`postgres-data`) is the authoritative store for pairings, watches, room links, queued deliveries, and audit records — include it in your backup plan (see [Docker: Data persistence & backups](docker.md#data-persistence-backups))
+
+## Audit coverage for live write paths
+
+Every external write performed by the running service records an entry in the
+`audit_logs` table. The canonical action names live in
+`src/dischat/security/audit.py` (`LIVE_WRITE_PATHS`).
+
+| Action | Operation | Target system | Actor / context | Target identifiers recorded | Failure policy |
+| --- | --- | --- | --- | --- | --- |
+| `create_pairing_pm` | Send the pairing-code PM to a Discourse account | Discourse | Requesting Matrix user (`mxid`, `platform`) | `discourse_username_used` (PM recipient) | Failed attempts are recorded with `success = FALSE` and `error_message`; the write error is re-raised so upstream retry/logic still sees it. |
+| `create_discourse_reply` | Relay a Matrix reply into a Discourse topic | Discourse | Matrix user (`mxid`, `platform`) or relay account username | `topic_id`, `post_id` (success only), `matrix_room_id`, `matrix_event_id` | Same failed-attempt policy. |
+| `deliver_matrix_room_message` | Deliver a Discourse post into a linked Matrix room | Matrix | `system` (`mxid = "system"`, `platform = "system"`) | `topic_id`, `post_id`, `matrix_room_id`, `matrix_event_id` | Same failed-attempt policy, including `missing_discourse_event` before any send is attempted. |
+| `deliver_matrix_dm_message` | Deliver a Discourse post as a Matrix DM | Matrix | `system` + target user (`mxid`) | `topic_id`, `post_id`, `mxid` (DM recipient), `matrix_room_id`, `matrix_event_id` | Same failed-attempt policy; `missing_dm_room_id` records the send result when no room id exists. |
+| `send_matrix_notice` | Send a Matrix notice: command responses and permission/error replies | Matrix | Requesting Matrix user (`mxid`, `platform`) | `matrix_room_id`, `matrix_event_id` (success only) | Same failed-attempt policy. |
+
+Audit policy:
+
+- **Attempts are recorded before the write.** For every live write path the
+  audit row is inserted with `status = 'pending'` *before* the external API
+  call, and the row's outcome (`status = 'success'` / `'failed'`,
+  `success`, `error_message`) is updated *after* the write completes but
+  *before* any dependent local persistence such as the
+  `delivery_messages.create_mapping(...)` insert. A crash between a successful
+  external write and its mapping insert therefore still leaves an audit row
+  (resolution: `status = 'pending'` means the write was attempted and may have
+  succeeded; `status = 'success'` proves it did). Migration
+  `0006_audit_attempt_status.sql` adds the `status` column with a
+  `('pending', 'success', 'failed')` check constraint.
+- **Failed attempts are retained.** Every external write records one row per
+  attempt regardless of outcome; failures use the same action name with
+  `success = FALSE`.
+- **Failure reasons are stored without secrets.** `error_message` contains a
+  stable reason token (for example `missing_discourse_event`) or the exception
+  class name plus redacted exception text, truncated to 200 characters on one
+  line. Exception text is never persisted verbatim: before truncation it is
+  redacted for secret-bearing shapes (API keys, tokens, passwords, bearer
+  tokens, pairing codes); every `http(s)://` URL is reduced to scheme + host
+  with its path and query replaced, so credentials embedded in URLs or query
+  strings cannot leak. Pairing codes and their hashes, API keys, access
+  tokens, and message bodies never enter `audit_logs`.
+- **Coverage is enforced structurally.** Migration
+  `0005_audit_write_paths.sql` adds an `action <> ''` check constraint plus
+  `(created_at)` and `(success, created_at)` indexes for triage queries, and
+  live write paths require an audit repository at wiring time
+  (`MissingAuditLoggerError`).
+
+Not audited (not message-content writes performed by the running bridge):
+
+- local PostgreSQL bookkeeping inside dischat itself (pairing sessions,
+  delivery mappings, job queue state)
+- read-only Discourse polls (`GET` endpoints) and Matrix syncs
+- room membership operations: invite acceptance, room joins, and DM-room
+  creation. These change membership only (no message content), are idempotent
+  (repeated joins/creates are no-ops), and carry no message payload, so they
+  are outside the message-write audit guarantee above.

@@ -3,7 +3,7 @@ from typing import Any
 
 from dischat.bridge import handle_matrix_reply
 from dischat.matrix.client import MatrixMessage, MatrixSendResult
-from dischat.security.audit import AuditEntry
+from dischat.security.audit import STATUS_FAILED, STATUS_SUCCESS, AuditEntry
 from dischat.storage.repositories import (
     ChatAccount,
     DeliveryMessageRecord,
@@ -152,9 +152,39 @@ class FakeDeliveryMessages:
 class FakeAuditLogs:
     def __init__(self) -> None:
         self.entries: list[AuditEntry] = []
+        self._next_id = 1
 
-    async def record(self, entry: AuditEntry) -> None:
+    async def record(self, entry: AuditEntry) -> int:
+        entry_id = self._next_id
+        self._next_id += 1
         self.entries.append(entry)
+        return entry_id
+
+    async def update_outcome(
+        self,
+        audit_log_id: int,
+        *,
+        success: bool,
+        error_message: str | None,
+        post_id: int | None = None,
+        matrix_event_id: str | None = None,
+        matrix_room_id: str | None = None,
+    ) -> None:
+        old = self.entries[audit_log_id - 1]
+        self.entries[audit_log_id - 1] = AuditEntry(
+            action=old.action,
+            discourse_username_used=old.discourse_username_used,
+            mxid=old.mxid,
+            platform=old.platform,
+            discourse_user_id_used=old.discourse_user_id_used,
+            topic_id=old.topic_id,
+            post_id=post_id,
+            matrix_room_id=matrix_room_id or old.matrix_room_id,
+            matrix_event_id=matrix_event_id or old.matrix_event_id,
+            success=success,
+            error_message=error_message,
+            status=STATUS_SUCCESS if success else STATUS_FAILED,
+        )
 
 
 async def test_handle_matrix_reply_posts_as_paired_user() -> None:

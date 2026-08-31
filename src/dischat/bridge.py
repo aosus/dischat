@@ -7,7 +7,15 @@ import httpx
 
 from dischat.i18n import translate
 from dischat.matrix.client import MatrixMessage, MatrixSendResult
-from dischat.security.audit import AuditEntry
+from dischat.security.audit import (
+    ACTION_DISCOURSE_REPLY,
+    ACTION_SEND_MATRIX_NOTICE,
+    STATUS_PENDING,
+    AuditEntry,
+    failure_reason,
+    record_audit_attempt,
+    update_audit_outcome,
+)
 from dischat.security.permissions import can_post_from_chat, detect_platform
 from dischat.storage.repositories import (
     ChatAccount,
@@ -82,7 +90,18 @@ class DeliveryMessagesRepo(Protocol):
 
 
 class AuditLogsRepo(Protocol):
-    async def record(self, entry: AuditEntry) -> None: ...
+    async def record(self, entry: AuditEntry) -> int | None: ...
+
+    async def update_outcome(
+        self,
+        audit_log_id: int,
+        *,
+        success: bool,
+        error_message: str | None,
+        post_id: int | None = None,
+        matrix_event_id: str | None = None,
+        matrix_room_id: str | None = None,
+    ) -> None: ...
 
 
 class MatrixEventMarker(Protocol):
@@ -233,6 +252,46 @@ def relay_username_for_platform(*, platform: str, matrix: str, telegram: str, di
     return matrix
 
 
+async def _send_notice_with_audit(
+    *,
+    matrix_client: MatrixNoticeClient,
+    audit_logs: Any,
+    room_id: str,
+    body: str,
+    mxid: str,
+    platform: str,
+) -> MatrixSendResult:
+    """Send a Matrix notice as an audited live write (attempt-first)."""
+    attempt_id = await record_audit_attempt(
+        audit_logs,
+        AuditEntry(
+            action=ACTION_SEND_MATRIX_NOTICE,
+            discourse_username_used="",
+            mxid=mxid,
+            platform=platform,
+            matrix_room_id=room_id,
+            success=None,
+            status=STATUS_PENDING,
+        ),
+        require_logger=True,
+    )
+    try:
+        result = await matrix_client.send_notice(room_id, body)
+    except Exception as exc:
+        await update_audit_outcome(
+            audit_logs, attempt_id, success=False, error_message=failure_reason(exc)
+        )
+        raise
+    await update_audit_outcome(
+        audit_logs,
+        attempt_id,
+        success=True,
+        error_message=None,
+        matrix_event_id=result.event_id,
+    )
+    return result
+
+
 async def handle_matrix_reply(
     *,
     message: MatrixMessage,
@@ -241,7 +300,7 @@ async def handle_matrix_reply(
     chat_accounts: ChatAccountsRepo,
     room_links: RoomLinksRepo,
     delivery_messages: DeliveryMessagesRepo,
-    audit_logs: AuditLogsRepo,
+    audit_logs: Any,
     event_state: MatrixEventStateRepo | None = None,
     relay_matrix_username: str,
     relay_telegram_username: str,
@@ -356,9 +415,13 @@ async def handle_matrix_reply(
     )
 
     if permission.decision == "reject":
-        response = await matrix_client.send_notice(
-            message.room_id,
-            translate("posting.requires_pairing", account.response_locale),
+        response = await _send_notice_with_audit(
+            matrix_client=matrix_client,
+            audit_logs=audit_logs,
+            room_id=message.room_id,
+            body=translate("posting.requires_pairing", account.response_locale),
+            mxid=message.sender,
+            platform=account.platform,
         )
         await _release_event_fence(
             event_state, room_id=message.room_id, event_id=message.event_id, lease_owner=lease_owner
@@ -401,9 +464,13 @@ async def handle_matrix_reply(
                     reply_to_post_number = topic_post.get("post_number")
                     break
     if not isinstance(reply_to_post_number, int):
-        response = await matrix_client.send_notice(
-            message.room_id,
-            translate("posting.requires_pairing", account.response_locale),
+        response = await _send_notice_with_audit(
+            matrix_client=matrix_client,
+            audit_logs=audit_logs,
+            room_id=message.room_id,
+            body=translate("posting.requires_pairing", account.response_locale),
+            mxid=message.sender,
+            platform=account.platform,
         )
         await _release_event_fence(
             event_state, room_id=message.room_id, event_id=message.event_id, lease_owner=lease_owner
@@ -433,6 +500,21 @@ async def handle_matrix_reply(
     # documented residual at-least-once window (docs/operations.md) applies
     # instead of a guaranteed duplicate.
     external_write_done = False
+    reply_audit_id = await record_audit_attempt(
+        audit_logs,
+        AuditEntry(
+            action=ACTION_DISCOURSE_REPLY,
+            mxid=message.sender,
+            platform=account.platform,
+            discourse_username_used=discourse_username or "",
+            topic_id=parent.discourse_topic_id,
+            matrix_room_id=message.room_id,
+            matrix_event_id=message.event_id,
+            success=None,
+            status=STATUS_PENDING,
+        ),
+        require_logger=True,
+    )
     try:
         write_result = await discourse_client.create_reply(
             topic_id=parent.discourse_topic_id,
@@ -460,6 +542,17 @@ async def handle_matrix_reply(
                     error_message="event_already_claimed",
                     discourse_post_id=outcome.conflicting_post_id,
                 )
+        # Resolve the audit attempt after the durable event outcome. If this
+        # local update fails, the event fence still prevents a duplicate
+        # Discourse write and the pending audit row truthfully signals an
+        # outcome that needs reconciliation.
+        await update_audit_outcome(
+            audit_logs,
+            reply_audit_id,
+            success=True,
+            error_message=None,
+            post_id=write_result.post_id,
+        )
         await delivery_messages.create_mapping(
             discourse_topic_id=write_result.topic_id,
             discourse_post_id=write_result.post_id,
@@ -469,7 +562,11 @@ async def handle_matrix_reply(
             target_mxid=None,
             parent_delivery_message_id=parent.id,
         )
-    except Exception:
+    except Exception as exc:
+        if not external_write_done:
+            await update_audit_outcome(
+                audit_logs, reply_audit_id, success=False, error_message=failure_reason(exc)
+            )
         if event_state is None or external_write_done:
             # Either no fence is managed here, or the external write already
             # completed: the marker is 'written' (release_event cannot delete
@@ -495,19 +592,6 @@ async def handle_matrix_reply(
             matrix_room_id=message.room_id,
             matrix_event_id=message.event_id,
         )
-    await audit_logs.record(
-        AuditEntry(
-            action="create_discourse_reply",
-            mxid=message.sender,
-            platform=account.platform,
-            discourse_username_used=discourse_username,
-            topic_id=write_result.topic_id,
-            post_id=write_result.post_id,
-            matrix_room_id=message.room_id,
-            matrix_event_id=message.event_id,
-            success=True,
-        )
-    )
     return BridgeResult(
         posted=True,
         discourse_username=discourse_username,

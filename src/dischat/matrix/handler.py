@@ -1,23 +1,36 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from typing import Any, Protocol
 
 from dischat.bridge import handle_matrix_reply
 from dischat.commands.parser import parse_command
-from dischat.matrix.client import NioMatrixClient
+from dischat.matrix.client import MatrixMessage, MatrixSendResult
+from dischat.security.audit import (
+    ACTION_PAIRING_PM,
+    ACTION_SEND_MATRIX_NOTICE,
+    STATUS_PENDING,
+    AuditEntry,
+    AuditLogsRepo,
+    failure_reason,
+    record_audit_attempt,
+    update_audit_outcome,
+)
 from dischat.security.permissions import detect_platform
-from dischat.service import DischatService, ServiceResponse
 from dischat.storage.repositories import new_lease_owner
 
 
 async def _deliver_fenced_command(
     *,
-    matrix_client: NioMatrixClient,
+    matrix_client: Any,
     discourse_client,
     event_state,
+    audit_logs: AuditLogsRepo | None,
+    sender_mxid: str,
+    sender_platform: str,
     room_id: str,
     event_id: str,
-    run_command: Callable[[], Awaitable[ServiceResponse | None]],
+    run_command: Callable[[], Awaitable[CommandResponseLike | None]],
 ) -> None:
     """Run a command behind the same durable fence the reply path uses.
 
@@ -46,13 +59,17 @@ async def _deliver_fenced_command(
         command_response = await run_command()
         if command_response is None:
             return
-        if command_response.pairing_code_to_deliver and command_response.pairing_target_username:
-            await discourse_client.create_private_message(
-                target_username=command_response.pairing_target_username,
-                title="Dischat pairing code",
-                raw=command_response.pairing_code_to_deliver,
-            )
-        await matrix_client.send_notice(room_id, command_response.body)
+        await _deliver_command_response(
+            discourse_client=discourse_client,
+            matrix_client=matrix_client,
+            audit_logs=audit_logs,
+            sender_mxid=sender_mxid,
+            sender_platform=sender_platform,
+            command_response_body=command_response.body,
+            pairing_code_to_deliver=command_response.pairing_code_to_deliver,
+            pairing_target_username=command_response.pairing_target_username,
+            room_id=room_id,
+        )
         return
 
     lease_owner = new_lease_owner()
@@ -88,7 +105,15 @@ async def _deliver_fenced_command(
             # confirm must not carry this attempt's token (it would never
             # match and the marker would stay 'written' forever).
             if marker.response_notice is not None:
-                await matrix_client.send_notice(room_id, marker.response_notice)
+                await _deliver_matrix_notice(
+                    matrix_client=matrix_client,
+                    audit_logs=audit_logs,
+                    sender_mxid=sender_mxid,
+                    sender_platform=sender_platform,
+                    body=marker.response_notice,
+                    room_id=room_id,
+                    pairing_target_username=None,
+                )
             await event_state.mark_event_processed(
                 matrix_room_id=room_id, matrix_event_id=event_id, lease_owner=None
             )
@@ -119,12 +144,14 @@ async def _deliver_fenced_command(
         # marker never promises a PM that was not sent; a crash after the PM
         # leaves a marker whose replay delivers the stored notice without
         # re-running the command (no second PM).
-        if command_response.pairing_code_to_deliver and command_response.pairing_target_username:
-            await discourse_client.create_private_message(
-                target_username=command_response.pairing_target_username,
-                title="Dischat pairing code",
-                raw=command_response.pairing_code_to_deliver,
-            )
+        await _deliver_pairing_pm(
+            discourse_client=discourse_client,
+            audit_logs=audit_logs,
+            sender_mxid=sender_mxid,
+            sender_platform=sender_platform,
+            pairing_code=command_response.pairing_code_to_deliver,
+            pairing_target_username=command_response.pairing_target_username,
+        )
         # Record the outcome for EVERY command (not just PM deliveries)
         # BEFORE the room notice: the fenced guarantee is that a replay
         # never re-executes the command itself, and commands like /unpair,
@@ -143,7 +170,15 @@ async def _deliver_fenced_command(
             # the winner owns the command's side effects and its pending
             # notice. Never treat our response as the source of truth.
             return
-        await matrix_client.send_notice(room_id, command_response.body)
+        await _deliver_matrix_notice(
+            matrix_client=matrix_client,
+            audit_logs=audit_logs,
+            sender_mxid=sender_mxid,
+            sender_platform=sender_platform,
+            body=command_response.body,
+            room_id=room_id,
+            pairing_target_username=command_response.pairing_target_username,
+        )
     except Exception:
         # Failed before run_command() returned (no external write happened
         # in this attempt) or while sending the notice with the outcome
@@ -165,21 +200,57 @@ async def _deliver_fenced_command(
     )
 
 
+class PairingPmWriter(Protocol):
+    async def create_private_message(
+        self,
+        *,
+        target_username: str,
+        title: str,
+        raw: str,
+    ) -> object: ...
+
+
+class MatrixSyncClient(Protocol):
+    user_id: str
+
+    def extract_messages(self, sync_response: object) -> list[MatrixMessage]: ...
+
+    async def send_notice(self, room_id: str, body: str) -> MatrixSendResult: ...
+
+
+class CommandService(Protocol):
+    async def handle_message(
+        self,
+        *,
+        mxid: str,
+        platform: str,
+        body: str,
+        locale: str,
+        live_e2e_category_id: int | None = None,
+    ) -> CommandResponseLike | None: ...
+
+
+class CommandResponseLike(Protocol):
+    body: str
+    pairing_code_to_deliver: str | None
+    pairing_target_username: str | None
+
+
 async def process_sync_messages(
     *,
-    matrix_client: NioMatrixClient,
-    service: DischatService,
+    matrix_client: Any,
+    service: CommandService,
     discourse_client,
     chat_accounts,
     room_links,
     delivery_messages,
-    audit_logs,
+    audit_logs: AuditLogsRepo | None = None,
     event_state=None,
     relay_matrix_username: str,
     relay_telegram_username: str,
     relay_discord_username: str,
     live_e2e_category_id: int | None,
-    sync_response,
+    sync_response: object,
 ) -> None:
     for message in matrix_client.extract_messages(sync_response):
         if message.sender == matrix_client.user_id:
@@ -192,6 +263,9 @@ async def process_sync_messages(
                 matrix_client=matrix_client,
                 discourse_client=discourse_client,
                 event_state=event_state,
+                audit_logs=audit_logs,
+                sender_mxid=message.sender,
+                sender_platform=detect_platform(message.sender),
                 room_id=message.room_id,
                 event_id=message.event_id,
                 run_command=lambda message=message: service.handle_message(
@@ -211,7 +285,17 @@ async def process_sync_messages(
             live_e2e_category_id=live_e2e_category_id,
         )
         if command_response is not None:
-            await matrix_client.send_notice(message.room_id, command_response.body)
+            await _deliver_command_response(
+                discourse_client=discourse_client,
+                matrix_client=matrix_client,
+                audit_logs=audit_logs,
+                sender_mxid=message.sender,
+                sender_platform=detect_platform(message.sender),
+                command_response_body=command_response.body,
+                pairing_code_to_deliver=command_response.pairing_code_to_deliver,
+                pairing_target_username=command_response.pairing_target_username,
+                room_id=message.room_id,
+            )
             continue
         if message.parent_event_id is None:
             continue
@@ -228,3 +312,110 @@ async def process_sync_messages(
             relay_telegram_username=relay_telegram_username,
             relay_discord_username=relay_discord_username,
         )
+
+
+async def _deliver_pairing_pm(
+    *,
+    discourse_client,
+    audit_logs: AuditLogsRepo | None,
+    sender_mxid: str,
+    sender_platform: str,
+    pairing_code: str | None,
+    pairing_target_username: str | None,
+) -> None:
+    if not pairing_code or not pairing_target_username:
+        return
+    attempt_id = await record_audit_attempt(
+        audit_logs,
+        AuditEntry(
+            action=ACTION_PAIRING_PM,
+            discourse_username_used=pairing_target_username,
+            mxid=sender_mxid,
+            platform=sender_platform,
+            success=None,
+            status=STATUS_PENDING,
+        ),
+        require_logger=True,
+    )
+    try:
+        await discourse_client.create_private_message(
+            target_username=pairing_target_username,
+            title="Dischat pairing code",
+            raw=pairing_code,
+        )
+    except Exception as exc:
+        await update_audit_outcome(
+            audit_logs, attempt_id, success=False, error_message=failure_reason(exc)
+        )
+        raise
+    await update_audit_outcome(audit_logs, attempt_id, success=True, error_message=None)
+
+
+async def _deliver_matrix_notice(
+    *,
+    matrix_client: Any,
+    audit_logs: AuditLogsRepo | None,
+    sender_mxid: str,
+    sender_platform: str,
+    body: str,
+    pairing_target_username: str | None,
+    room_id: str,
+) -> None:
+    attempt_id = await record_audit_attempt(
+        audit_logs,
+        AuditEntry(
+            action=ACTION_SEND_MATRIX_NOTICE,
+            discourse_username_used=pairing_target_username or "",
+            mxid=sender_mxid,
+            platform=sender_platform,
+            matrix_room_id=room_id,
+            success=None,
+            status=STATUS_PENDING,
+        ),
+        require_logger=True,
+    )
+    try:
+        notice_result = await matrix_client.send_notice(room_id, body)
+    except Exception as exc:
+        await update_audit_outcome(
+            audit_logs, attempt_id, success=False, error_message=failure_reason(exc)
+        )
+        raise
+    await update_audit_outcome(
+        audit_logs,
+        attempt_id,
+        success=True,
+        error_message=None,
+        matrix_event_id=notice_result.event_id,
+    )
+
+
+async def _deliver_command_response(
+    *,
+    discourse_client,
+    matrix_client: Any,
+    audit_logs: AuditLogsRepo | None,
+    sender_mxid: str,
+    sender_platform: str,
+    command_response_body: str,
+    pairing_code_to_deliver: str | None,
+    pairing_target_username: str | None,
+    room_id: str,
+) -> None:
+    await _deliver_pairing_pm(
+        discourse_client=discourse_client,
+        audit_logs=audit_logs,
+        sender_mxid=sender_mxid,
+        sender_platform=sender_platform,
+        pairing_code=pairing_code_to_deliver,
+        pairing_target_username=pairing_target_username,
+    )
+    await _deliver_matrix_notice(
+        matrix_client=matrix_client,
+        audit_logs=audit_logs,
+        sender_mxid=sender_mxid,
+        sender_platform=sender_platform,
+        body=command_response_body,
+        pairing_target_username=pairing_target_username,
+        room_id=room_id,
+    )

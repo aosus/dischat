@@ -231,6 +231,7 @@ async def test_drain_delivery_jobs_marks_completed_and_failed(monkeypatch) -> No
         chat_accounts=object(),
         room_links=object(),
         matrix_client=object(),
+        audit_logs=object(),
     )
 
     async def fake_deliver_job(**kwargs):

@@ -142,8 +142,12 @@ class FakeAuditLogs:
     def __init__(self) -> None:
         self.entries: list[AuditEntry] = []
 
-    async def record(self, entry: AuditEntry) -> None:
+    async def record(self, entry: AuditEntry) -> int:
         self.entries.append(entry)
+        return len(self.entries)
+
+    async def update_outcome(self, audit_log_id: int, **kwargs) -> None:
+        return None
 
 
 class FakeDeliveryMessages:
@@ -456,7 +460,7 @@ async def test_sync_token_survives_restart(pg_pool) -> None:
             return []
 
     class _NoopJobs:
-        async def claim_next_job(self, *, lease_seconds: int):
+        async def claim_next_job(self):
             return None
 
     first_context = SimpleNamespace(

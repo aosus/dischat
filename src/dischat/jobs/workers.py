@@ -12,7 +12,17 @@ from dischat.discourse.formatting import (
     format_topic_delivery_html,
 )
 from dischat.i18n import translate
-from dischat.matrix.client import MatrixClient
+from dischat.security.audit import (
+    ACTION_DM_DELIVERY,
+    ACTION_ROOM_DELIVERY,
+    STATUS_PENDING,
+    STATUS_SUCCESS,
+    AuditEntry,
+    failure_reason,
+    record_audit_attempt,
+    record_audit_entry,
+    update_audit_outcome,
+)
 from dischat.storage.repositories import (
     ChatAccount,
     DeliveryJobRecord,
@@ -22,6 +32,7 @@ from dischat.storage.repositories import (
 )
 
 logger = logging.getLogger(__name__)
+SYSTEM_ACTOR = "system"
 
 
 @dataclass(slots=True, frozen=True)
@@ -76,6 +87,21 @@ class DeliveryJobsRepo(Protocol):
     async def pin_matrix_dm_room(self, job_id: int, *, room_id: str) -> str: ...
 
 
+class AuditLogsRepo(Protocol):
+    async def record(self, entry: AuditEntry) -> int | None: ...
+
+    async def update_outcome(
+        self,
+        audit_log_id: int,
+        *,
+        success: bool,
+        error_message: str | None,
+        post_id: int | None = None,
+        matrix_event_id: str | None = None,
+        matrix_room_id: str | None = None,
+    ) -> None: ...
+
+
 def _render_discourse_body(payload: dict[str, object]) -> str:
     raw = payload.get("raw")
     if isinstance(raw, str) and raw.strip():
@@ -121,7 +147,7 @@ def _render_delivery_content(
 
 async def _find_existing_room_mapping(
     *,
-    delivery_messages: DeliveryMessagesRepo,
+    delivery_messages: Any,
     discourse_post_id: int,
     matrix_room_id: str,
 ) -> DeliveryMessageRecord | None:
@@ -140,7 +166,7 @@ async def _find_existing_room_mapping(
 
 async def _find_existing_dm_mapping(
     *,
-    delivery_messages: DeliveryMessagesRepo,
+    delivery_messages: Any,
     discourse_post_id: int,
     target_mxid: str,
 ) -> DeliveryMessageRecord | None:
@@ -162,14 +188,27 @@ async def deliver_job(
     *,
     job: DeliveryJobRecord,
     discourse_events: DiscourseEventsRepo,
-    delivery_messages: DeliveryMessagesRepo,
+    delivery_messages: Any,
     chat_accounts: ChatAccountsRepo,
     room_links: RoomLinksRepo,
-    matrix_client: MatrixClient,
+    matrix_client: Any,
     delivery_jobs: DeliveryJobsRepo | None = None,
+    audit_logs: AuditLogsRepo | None = None,
 ) -> WorkerResult:
     event = await discourse_events.get_by_id(job.event_id)
     if event is None:
+        await record_audit_entry(
+            audit_logs,
+            AuditEntry(
+                action=ACTION_ROOM_DELIVERY if job.target_type == "room" else ACTION_DM_DELIVERY,
+                discourse_username_used=SYSTEM_ACTOR,
+                mxid=SYSTEM_ACTOR,
+                platform="system",
+                matrix_room_id=job.matrix_room_id,
+                success=False,
+                error_message="missing_discourse_event",
+            ),
+        )
         return WorkerResult(complete=False, error="missing_discourse_event")
     # Durable idempotency for the post-send/pre-persist window: stamp a stable
     # transaction id BEFORE the Matrix write. If the process dies after the
@@ -216,6 +255,49 @@ async def deliver_job(
         )
         if existing_mapping is not None:
             return WorkerResult(complete=True)
+
+    action = ACTION_ROOM_DELIVERY if job.target_type == "room" else ACTION_DM_DELIVERY
+
+    result_room_id: str | None = None
+    target_mxid: str | None = None
+
+    def build_entry(
+        matrix_event_id: str | None, error: str | None, *, status: str = STATUS_SUCCESS
+    ) -> AuditEntry:
+        # Pending attempt rows carry success=None: the outcome is unknown until
+        # update_audit_outcome runs, and a crash before that must not leave a
+        # durable row that legacy `success = TRUE` queries count as delivered.
+        success: bool | None
+        if status == STATUS_PENDING and error is None:
+            success = None
+        else:
+            success = error is None
+        return AuditEntry(
+            action=action,
+            discourse_username_used=SYSTEM_ACTOR,
+            mxid=target_mxid,
+            platform="system",
+            topic_id=event.discourse_topic_id,
+            post_id=event.discourse_post_id,
+            matrix_room_id=result_room_id,
+            matrix_event_id=matrix_event_id,
+            success=success,
+            error_message=error,
+            status=status,
+        )
+
+    async def audit_attempt() -> int | None:
+        # Live write path: audit must be wired, or the send is refused before
+        # any unrecorded external write can happen. Called only AFTER all
+        # local preparation has succeeded, immediately before the external
+        # write: a pre-send failure must never leave a pending success=NULL
+        # row, which is indistinguishable from a crash during the write.
+        return await record_audit_attempt(
+            audit_logs, build_entry(None, None, status=STATUS_PENDING), require_logger=True
+        )
+
+    if job.target_type == "room" and job.matrix_room_id is not None:
+        result_room_id = job.matrix_room_id
         room_link = await room_links.get_by_room_id(job.matrix_room_id)
         rendered_body, formatted = _render_delivery_content(
             event.raw_payload_json,
@@ -228,21 +310,37 @@ async def deliver_job(
                 discourse_post_id=reply_to_post_id,
                 matrix_room_id=job.matrix_room_id,
             )
-        if parent_mapping is not None:
-            result = await matrix_client.send_reply(
-                job.matrix_room_id,
-                rendered_body,
-                parent_mapping.matrix_event_id,
-                formatted=formatted,
-                tx_id=matrix_tx_id,
+        audit_log_id = await audit_attempt()
+        send_kwargs: dict[str, Any] = {"formatted": formatted}
+        if matrix_tx_id is not None:
+            send_kwargs["tx_id"] = matrix_tx_id
+        try:
+            if parent_mapping is not None:
+                result = await matrix_client.send_reply(
+                    job.matrix_room_id,
+                    rendered_body,
+                    parent_mapping.matrix_event_id,
+                    **send_kwargs,
+                )
+            else:
+                result = await matrix_client.send_text(
+                    job.matrix_room_id,
+                    rendered_body,
+                    **send_kwargs,
+                )
+        except Exception as exc:
+            await update_audit_outcome(
+                audit_logs, audit_log_id, success=False, error_message=failure_reason(exc)
             )
-        else:
-            result = await matrix_client.send_text(
-                job.matrix_room_id,
-                rendered_body,
-                formatted=formatted,
-                tx_id=matrix_tx_id,
-            )
+            raise
+        await update_audit_outcome(
+            audit_logs,
+            audit_log_id,
+            success=True,
+            error_message=None,
+            post_id=event.discourse_post_id,
+            matrix_event_id=result.event_id,
+        )
         try:
             await delivery_messages.create_mapping(
                 discourse_topic_id=event.discourse_topic_id,
@@ -297,15 +395,41 @@ async def deliver_job(
         else:
             # Legacy call sites without a jobs repo: resolve without a pin.
             pinned_room_id = await matrix_client.resolve_dm_room(job.target_mxid)
-        result = await matrix_client.send_dm(
-            pinned_room_id,
-            body or translate("pairing.unpaired", locale),
-            formatted=formatted,
-            tx_id=matrix_tx_id,
-        )
+        target_mxid = job.target_mxid
+        result_room_id = pinned_room_id
+        audit_log_id = await audit_attempt()
+        send_kwargs = {"formatted": formatted}
+        if matrix_tx_id is not None:
+            send_kwargs["tx_id"] = matrix_tx_id
+        try:
+            result = await matrix_client.send_dm(
+                pinned_room_id,
+                body or translate("pairing.unpaired", locale),
+                **send_kwargs,
+            )
+        except Exception as exc:
+            await update_audit_outcome(
+                audit_logs, audit_log_id, success=False, error_message=failure_reason(exc)
+            )
+            raise
         room_id = result.room_id or pinned_room_id
         if room_id is None:
+            await update_audit_outcome(
+                audit_logs,
+                audit_log_id,
+                success=False,
+                error_message="missing_dm_room_id",
+            )
             return WorkerResult(complete=False, error="missing_dm_room_id")
+        await update_audit_outcome(
+            audit_logs,
+            audit_log_id,
+            success=True,
+            error_message=None,
+            post_id=event.discourse_post_id,
+            matrix_event_id=result.event_id,
+            matrix_room_id=room_id,
+        )
         try:
             await delivery_messages.create_mapping(
                 discourse_topic_id=event.discourse_topic_id,
@@ -326,4 +450,17 @@ async def deliver_job(
             )
             return WorkerResult(complete=False, error="mapping_persistence_failed")
         return WorkerResult(complete=True)
+    await record_audit_entry(
+        audit_logs,
+        AuditEntry(
+            action=action,
+            discourse_username_used=SYSTEM_ACTOR,
+            mxid=target_mxid,
+            platform="system",
+            topic_id=event.discourse_topic_id,
+            post_id=event.discourse_post_id,
+            success=False,
+            error_message="unsupported_delivery_target",
+        ),
+    )
     return WorkerResult(complete=False, error="unsupported_delivery_target")

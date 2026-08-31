@@ -42,6 +42,7 @@ async def drain_delivery_jobs(context) -> int:
                 room_links=context.room_links,
                 matrix_client=context.matrix_client,
                 delivery_jobs=context.delivery_jobs,
+                audit_logs=getattr(context, "audit_logs", None),
             )
         except asyncio.CancelledError:
             # Shutdown: leave the lease to expire so another worker reclaims the job.

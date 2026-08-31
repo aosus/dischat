@@ -8,7 +8,11 @@ from typing import Any, Literal
 
 import asyncpg
 
-from dischat.security.audit import AuditEntry
+from dischat.security.audit import (
+    STATUS_FAILED,
+    STATUS_SUCCESS,
+    AuditEntry,
+)
 
 WatchMode = Literal["category", "all_public_categories"]
 JobStatus = Literal["pending", "running", "complete", "failed"]
@@ -1331,9 +1335,9 @@ class AuditLogRepository:
     def __init__(self, pool: asyncpg.Pool) -> None:
         self._pool = pool
 
-    async def record(self, entry: AuditEntry) -> None:
+    async def record(self, entry: AuditEntry) -> int | None:
         async with self._pool.acquire() as connection:
-            await connection.execute(
+            row = await connection.fetchrow(
                 """
                 INSERT INTO audit_logs (
                     action,
@@ -1347,9 +1351,11 @@ class AuditLogRepository:
                     matrix_event_id,
                     success,
                     error_message,
+                    status,
                     created_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                RETURNING id
                 """,
                 entry.action,
                 entry.mxid,
@@ -1362,7 +1368,42 @@ class AuditLogRepository:
                 entry.matrix_event_id,
                 entry.success,
                 entry.error_message,
+                entry.status,
                 datetime.now(UTC),
+            )
+        if row is None:
+            return None
+        return int(row["id"])
+
+    async def update_outcome(
+        self,
+        audit_log_id: int,
+        *,
+        success: bool,
+        error_message: str | None,
+        post_id: int | None = None,
+        matrix_event_id: str | None = None,
+        matrix_room_id: str | None = None,
+    ) -> None:
+        async with self._pool.acquire() as connection:
+            await connection.execute(
+                """
+                UPDATE audit_logs
+                SET success = $2,
+                    error_message = $3,
+                    status = $4,
+                    post_id = COALESCE($5, post_id),
+                    matrix_event_id = COALESCE($6, matrix_event_id),
+                    matrix_room_id = COALESCE($7, matrix_room_id)
+                WHERE id = $1
+                """,
+                audit_log_id,
+                success,
+                error_message,
+                STATUS_SUCCESS if success else STATUS_FAILED,
+                post_id,
+                matrix_event_id,
+                matrix_room_id,
             )
 
 

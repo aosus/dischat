@@ -13,10 +13,28 @@ from typing import Any
 
 import pytest
 
-from dischat.jobs.workers import deliver_job
+from dischat.jobs.workers import deliver_job as _deliver_job
 from dischat.main import drain_delivery_jobs
 from dischat.matrix.client import MatrixSendResult
 from dischat.storage.repositories import DeliveryJobRecord, DeliveryMessageRecord, TargetType
+
+
+class FakeAuditLogs:
+    def __init__(self) -> None:
+        self._next_id = 1
+
+    async def record(self, entry) -> int:
+        audit_id = self._next_id
+        self._next_id += 1
+        return audit_id
+
+    async def update_outcome(self, audit_log_id: int, **kwargs) -> None:
+        return None
+
+
+async def deliver_job(**kwargs):
+    kwargs.setdefault("audit_logs", FakeAuditLogs())
+    return await _deliver_job(**kwargs)
 
 
 @dataclass(slots=True)
@@ -267,6 +285,7 @@ def _make_context(
         chat_accounts=FakeChatAccounts(),
         room_links=FakeRoomLinks(),
         matrix_client=matrix_client,
+        audit_logs=FakeAuditLogs(),
     )
 
 
