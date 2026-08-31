@@ -9,6 +9,7 @@ from dischat.jobs.workers import deliver_job
 from dischat.logging import configure_logging
 from dischat.matrix.handler import process_sync_messages
 from dischat.runtime import build_context
+from dischat.security.audit import failure_reason
 from dischat.service import backoff_delay
 from dischat.storage.repositories import DEFAULT_JOB_LEASE_SECONDS
 from dischat.subscriptions.bootstrap import (
@@ -33,6 +34,10 @@ async def drain_delivery_jobs(context) -> int:
         job = await context.delivery_jobs.claim_next_job(lease_seconds=lease_seconds)
         if job is None:
             return delivered
+        heartbeat = asyncio.create_task(
+            _renew_job_lease(context, job, lease_seconds),
+            name=f"delivery-lease-{job.id}",
+        )
         try:
             result = await deliver_job(
                 job=job,
@@ -43,6 +48,10 @@ async def drain_delivery_jobs(context) -> int:
                 matrix_client=context.matrix_client,
                 delivery_jobs=context.delivery_jobs,
                 audit_logs=getattr(context, "audit_logs", None),
+                categories=getattr(context, "categories", None),
+                live_e2e_category_id=getattr(
+                    getattr(context, "settings", None), "discourse_test_category_id", None
+                ),
             )
         except asyncio.CancelledError:
             # Shutdown: leave the lease to expire so another worker reclaims the job.
@@ -58,10 +67,16 @@ async def drain_delivery_jobs(context) -> int:
             await context.delivery_jobs.mark_failed(
                 job.id,
                 claim_token=job.claim_token or "",
-                error=f"{exc.__class__.__name__}: {exc}",
+                error=failure_reason(exc),
                 next_attempt_at=backoff_delay(job.attempts),
             )
             continue
+        finally:
+            heartbeat.cancel()
+            try:
+                await heartbeat
+            except asyncio.CancelledError:
+                pass
         if result.complete:
             fenced = await context.delivery_jobs.mark_complete(
                 job.id, claim_token=job.claim_token or ""
@@ -87,6 +102,21 @@ async def drain_delivery_jobs(context) -> int:
                 "Delivery job %s failed but its claim was lost; leaving the newer claim in charge",
                 job.id,
             )
+
+
+async def _renew_job_lease(context, job, lease_seconds: int) -> None:
+    """Keep a live delivery claim from expiring during slow external I/O."""
+    interval = max(1.0, lease_seconds / 3)
+    while True:
+        await asyncio.sleep(interval)
+        renewed = await context.delivery_jobs.renew_lease(
+            job.id,
+            claim_token=job.claim_token or "",
+            lease_seconds=lease_seconds,
+        )
+        if renewed is None:
+            logger.warning("Delivery job %s lost its lease during processing", job.id)
+            return
 
 
 async def refresh_category_visibility(*, context, settings, poll_state: PollerState) -> bool:
@@ -130,13 +160,12 @@ async def refresh_category_visibility(*, context, settings, poll_state: PollerSt
 async def run_iteration(
     *, context, settings, poll_state: PollerState, sync_since: str | None
 ) -> str | None:
-    await refresh_category_visibility(context=context, settings=settings, poll_state=poll_state)
     sync_response = await context.matrix_client.sync_once(
         since=sync_since,
         timeout_ms=0 if sync_since is None else settings.poll_interval_seconds * 1000,
     )
     await context.matrix_client.accept_invites(sync_response)
-    await process_sync_messages(
+    matrix_batch_result = await process_sync_messages(
         matrix_client=context.matrix_client,
         service=context.service,
         discourse_client=context.discourse_client,
@@ -151,6 +180,9 @@ async def run_iteration(
         live_e2e_category_id=settings.discourse_test_category_id,
         sync_response=sync_response,
     )
+    # Older adapters/test doubles returned None; only an explicit False means
+    # the batch contains a live-lease/deferred event and cannot be checkpointed.
+    matrix_batch_terminal = matrix_batch_result is not False
 
     logger = logging.getLogger(__name__)
     # Fail closed: when the pre-poll visibility revalidation failed, do not poll Discourse
@@ -158,6 +190,10 @@ async def run_iteration(
     # `refresh_category_visibility` above retries on every iteration and clears the flag
     # on success, so polling resumes automatically. Delivery of already-enqueued jobs
     # continues below so the outbound side keeps draining.
+    # Revalidate immediately before the privileged admin-key post poll. Doing
+    # this before Matrix long-polling leaves a confidentiality window equal to
+    # the sync timeout plus command processing time.
+    await refresh_category_visibility(context=context, settings=settings, poll_state=poll_state)
     processed = await poll_once(
         client=context.discourse_client,
         state=poll_state,
@@ -177,6 +213,12 @@ async def run_iteration(
     delivered = await drain_delivery_jobs(context)
     if delivered:
         logger.info("Delivered %s Matrix jobs", delivered)
+    next_batch = getattr(sync_response, "next_batch", None)
+    if matrix_batch_terminal and isinstance(next_batch, str) and context_has_matrix_state(context):
+        # Commit the continuation token before retention. If this write fails,
+        # no replay fence is pruned from under the still-old durable token.
+        await context.matrix_state.set_sync_next_batch(next_batch)
+
     # Ledger retention: confirmed ('processed') markers past the window are
     # dead weight — the fence only needs them to outlive the /sync replay
     # horizon. Pruning every iteration keeps matrix_event_state bounded with
@@ -190,14 +232,9 @@ async def run_iteration(
             )
         except Exception:  # pragma: no cover - defensive: retention is best-effort
             logger.warning("matrix_event_state retention prune failed", exc_info=True)
-    next_batch = getattr(sync_response, "next_batch", None)
-    if isinstance(next_batch, str) and context_has_matrix_state(context):
-        # Persist the /sync continuation token durably. It is written only
-        # after the batch's side effects (event processing, Discourse polling,
-        # delivery drain) completed, so a restart resumes from the last fully
-        # processed batch instead of replaying or skipping one.
-        await context.matrix_state.set_sync_next_batch(next_batch)
-    return next_batch if isinstance(next_batch, str) else sync_since
+    if matrix_batch_terminal and isinstance(next_batch, str):
+        return next_batch
+    return sync_since
 
 
 def context_has_matrix_state(context) -> bool:

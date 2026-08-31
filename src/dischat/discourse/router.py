@@ -13,7 +13,11 @@ from dischat.storage.repositories import (
 
 class RoomLinksRepo(Protocol):
     async def list_links_matching_category(
-        self, category_slug: str, *, include_non_public: bool = False
+        self,
+        category_slug: str,
+        *,
+        category_id: int | None = None,
+        include_non_public: bool = False,
     ) -> list[RoomLinkRecord]: ...
 
 
@@ -62,7 +66,9 @@ async def route_event(
     # repository queries only match public, enabled categories.
     if category_slug is not None and discourse_event.event_type == "new_topic":
         for room_link in await room_links.list_links_matching_category(
-            category_slug, include_non_public=include_non_public_category
+            category_slug,
+            category_id=category_id,
+            include_non_public=include_non_public_category,
         ):
             await delivery_jobs.enqueue(
                 event_id=event_id,

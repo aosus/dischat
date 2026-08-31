@@ -48,7 +48,7 @@ class Settings(BaseSettings):
         default="", alias="DISCOURSE_RELAY_DISCORD_USERNAME"
     )
     poll_interval_seconds: int = Field(default=60, alias="POLL_INTERVAL_SECONDS")
-    delivery_job_lease_seconds: int = Field(default=120, alias="DELIVERY_JOB_LEASE_SECONDS")
+    delivery_job_lease_seconds: int = Field(default=120, gt=0, alias="DELIVERY_JOB_LEASE_SECONDS")
     config_file: Path = Field(default=Path("config.yaml"), alias="CONFIG_FILE")
     default_locale: Locale = Field(default="ar", alias="DEFAULT_LOCALE")
     discourse_test_category_id: int | None = Field(default=None, alias="DISCOURSE_TEST_CATEGORY_ID")
@@ -88,15 +88,15 @@ class Settings(BaseSettings):
             raise ValueError(
                 "Missing Matrix authentication: MATRIX_ACCESS_TOKEN or MATRIX_BOT_PASSWORD"
             )
-        if (
-            self.matrix_access_token is None
-            and self.matrix_bot_password
-            and (not self.matrix_device_id)
-        ):
+        if not self.matrix_device_id:
             raise ValueError(
-                "MATRIX_DEVICE_ID is required with password auth: Matrix transaction "
-                "ids are device-scoped, so restart-safe deduplication needs a stable "
-                "device id across restarts."
+                "MATRIX_DEVICE_ID is required for every authentication mode: Matrix "
+                "transaction ids are device-scoped, so restart-safe deduplication "
+                "needs a stable, verified device id across restarts."
+            )
+        if self.discourse_test_category_id not in (None, 56):
+            raise ValueError(
+                "DISCOURSE_TEST_CATEGORY_ID is a live-test escape hatch and may only be 56"
             )
 
 

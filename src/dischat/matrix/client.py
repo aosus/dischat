@@ -16,6 +16,7 @@ from nio import (
     RoomMessageText,
     RoomSendResponse,
     SyncResponse,
+    WhoamiResponse,
 )
 
 from dischat.matrix.formatting import plain_notice, plain_text, reply_message, rich_text
@@ -119,6 +120,7 @@ class NioMatrixClient:
 
     async def login(self) -> None:
         if self._client.access_token:
+            await self._verify_device_identity()
             return
         if not self._password:
             raise ValueError("Matrix password is required when access token is missing.")
@@ -132,6 +134,20 @@ class NioMatrixClient:
         # nio re-logs in as the same device and the durable tx ids stay valid.
         if self._client.access_token is not None:
             self._access_token_cache[self._cache_key] = self._client.access_token
+        await self._verify_device_identity()
+
+    async def _verify_device_identity(self) -> None:
+        """Fail closed if the configured identity is not the token's real device."""
+        if not self._device_id:
+            raise ValueError("MATRIX_DEVICE_ID is required for restart-safe delivery.")
+        response = await self._client.whoami()
+        if not isinstance(response, WhoamiResponse):
+            raise ValueError(f"Matrix whoami failed: {response}")
+        if response.device_id != self._device_id:
+            raise ValueError(
+                "MATRIX_DEVICE_ID does not match the authenticated access token "
+                f"(configured {self._device_id!r}, actual {response.device_id!r})."
+            )
 
     async def close(self) -> None:
         await self._client.close()

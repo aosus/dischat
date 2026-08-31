@@ -31,7 +31,7 @@ async def _deliver_fenced_command(
     room_id: str,
     event_id: str,
     run_command: Callable[[], Awaitable[CommandResponseLike | None]],
-) -> None:
+) -> bool:
     """Run a command behind the same durable fence the reply path uses.
 
     Fence protocol (only when ``event_state`` is configured):
@@ -58,7 +58,7 @@ async def _deliver_fenced_command(
     if event_state is None:
         command_response = await run_command()
         if command_response is None:
-            return
+            return True
         await _deliver_command_response(
             discourse_client=discourse_client,
             matrix_client=matrix_client,
@@ -70,7 +70,7 @@ async def _deliver_fenced_command(
             pairing_target_username=command_response.pairing_target_username,
             room_id=room_id,
         )
-        return
+        return True
 
     lease_owner = new_lease_owner()
     claimed = await event_state.claim_event(
@@ -80,7 +80,7 @@ async def _deliver_fenced_command(
     )
     if claimed is None:
         marker = await event_state.get_event(matrix_room_id=room_id, matrix_event_id=event_id)
-        if marker is not None and marker.status in ("claimed", "owned"):
+        if marker is not None and marker.status == "claimed":
             # Exclusive takeover of a demonstrably stale fence: the row moves
             # to 'owned' under this attempt's token, so exactly one racing
             # replay can win. The repository only releases a fence whose
@@ -94,11 +94,11 @@ async def _deliver_fenced_command(
             if adopted is None:
                 # A live worker or a concurrent replay owns the command's
                 # side effects now.
-                return
+                return False
             # Fence taken over: fall through and run the command.
         elif marker is not None and marker.status in ("written", "processed"):
             if marker.status == "processed":
-                return
+                return True
             # 'written': the predecessor already ran the command and its side
             # effects exist. Finish only the pending notice; never re-run the
             # command. The recorded outcome cleared the lease columns, so the
@@ -117,7 +117,11 @@ async def _deliver_fenced_command(
             await event_state.mark_event_processed(
                 matrix_room_id=room_id, matrix_event_id=event_id, lease_owner=None
             )
-            return
+            return True
+        elif marker is not None and marker.status == "owned":
+            # A predecessor may already have committed an external write.
+            # Preserve the marker for reconciliation and never replay it.
+            return True
         else:
             # No marker (released between the claim and this read, or removed
             # manually); retry the claim and process as a fresh attempt.
@@ -129,15 +133,22 @@ async def _deliver_fenced_command(
                 )
                 is None
             ):
-                return
+                return False
 
     try:
+        begin_write = getattr(event_state, "begin_event_write", None)
+        if begin_write is not None and not await begin_write(
+            matrix_room_id=room_id,
+            matrix_event_id=event_id,
+            lease_owner=lease_owner,
+        ):
+            return False
         command_response = await run_command()
         if command_response is None:
             await event_state.mark_event_processed(
                 matrix_room_id=room_id, matrix_event_id=event_id, lease_owner=lease_owner
             )
-            return
+            return True
         # Pairing-specific delivery first: the code goes to the user's
         # Discourse DM, not the room notice. The PM is the command's external
         # write and completes before the outcome is recorded, so a 'written'
@@ -169,7 +180,7 @@ async def _deliver_fenced_command(
             # This attempt lost the fence while its command was in flight;
             # the winner owns the command's side effects and its pending
             # notice. Never treat our response as the source of truth.
-            return
+            return True
         await _deliver_matrix_notice(
             matrix_client=matrix_client,
             audit_logs=audit_logs,
@@ -198,6 +209,7 @@ async def _deliver_fenced_command(
     await event_state.mark_event_processed(
         matrix_room_id=room_id, matrix_event_id=event_id, lease_owner=None
     )
+    return True
 
 
 class PairingPmWriter(Protocol):
@@ -251,7 +263,8 @@ async def process_sync_messages(
     relay_discord_username: str,
     live_e2e_category_id: int | None,
     sync_response: object,
-) -> None:
+) -> bool:
+    all_terminal = True
     for message in matrix_client.extract_messages(sync_response):
         if message.sender == matrix_client.user_id:
             continue
@@ -259,7 +272,7 @@ async def process_sync_messages(
             # Side-effecting commands get the same durable fence as replies:
             # without it, a crash after the pairing PM but before the sync
             # token advanced would replay the command and send a second PM.
-            await _deliver_fenced_command(
+            terminal = await _deliver_fenced_command(
                 matrix_client=matrix_client,
                 discourse_client=discourse_client,
                 event_state=event_state,
@@ -276,30 +289,32 @@ async def process_sync_messages(
                     live_e2e_category_id=live_e2e_category_id,
                 ),
             )
+            all_terminal = all_terminal and terminal
             continue
-        command_response = await service.handle_message(
-            mxid=message.sender,
-            platform=detect_platform(message.sender),
-            body=message.body,
-            locale="ar",
-            live_e2e_category_id=live_e2e_category_id,
-        )
-        if command_response is not None:
-            await _deliver_command_response(
-                discourse_client=discourse_client,
+        if message.parent_event_id is None:
+            # Pairing-code verification mutates session/account state even
+            # though it is not slash-prefixed. Fence all unthreaded messages;
+            # harmless chat with no active session simply records processed.
+            terminal = await _deliver_fenced_command(
                 matrix_client=matrix_client,
+                discourse_client=discourse_client,
+                event_state=event_state,
                 audit_logs=audit_logs,
                 sender_mxid=message.sender,
                 sender_platform=detect_platform(message.sender),
-                command_response_body=command_response.body,
-                pairing_code_to_deliver=command_response.pairing_code_to_deliver,
-                pairing_target_username=command_response.pairing_target_username,
                 room_id=message.room_id,
+                event_id=message.event_id,
+                run_command=lambda message=message: service.handle_message(
+                    mxid=message.sender,
+                    platform=detect_platform(message.sender),
+                    body=message.body,
+                    locale="ar",
+                    live_e2e_category_id=live_e2e_category_id,
+                ),
             )
+            all_terminal = all_terminal and terminal
             continue
-        if message.parent_event_id is None:
-            continue
-        await handle_matrix_reply(
+        result = await handle_matrix_reply(
             message=message,
             discourse_client=discourse_client,
             matrix_client=matrix_client,
@@ -312,6 +327,9 @@ async def process_sync_messages(
             relay_telegram_username=relay_telegram_username,
             relay_discord_username=relay_discord_username,
         )
+        if result.error_message in ("event_already_claimed", "parent_mapping_pending"):
+            all_terminal = False
+    return all_terminal
 
 
 async def _deliver_pairing_pm(

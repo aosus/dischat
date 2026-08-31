@@ -200,6 +200,16 @@ class DischatService:
         if self._pairing_rate_limits is None:
             return
         policy = self._rate_limit_policy()
+        atomic = getattr(self._pairing_rate_limits, "record_failure_and_apply_cooldown", None)
+        if atomic is not None and discourse_username is not None:
+            await atomic(
+                mxid=mxid,
+                discourse_username=discourse_username,
+                now=now,
+                max_failures=policy.max_failures,
+                cooldown=policy.failure_cooldown,
+            )
+            return
         target_state = await self._pairing_rate_limits.record_failure(
             mxid=mxid,
             discourse_username=discourse_username.lower() if discourse_username else None,
@@ -281,6 +291,8 @@ class DischatService:
                 )
             )
         updated = await self._pairing_sessions.increment_attempt_count(session.id)
+        if updated is None:
+            return ServiceResponse(body=translate("pairing.invalid_code", account.response_locale))
         code = body.strip()
         if not code.isdigit() or len(code) != 6:
             return ServiceResponse(body=translate("pairing.prompt_code", account.response_locale))
@@ -289,7 +301,9 @@ class DischatService:
                 mxid=mxid, discourse_username=updated.discourse_username, now=now
             )
             return ServiceResponse(body=translate("pairing.invalid_code", account.response_locale))
-        await self._pairing_sessions.consume_session(updated.id)
+        consumed = await self._pairing_sessions.consume_session(updated.id)
+        if consumed is None:
+            return ServiceResponse(body=translate("pairing.invalid_code", account.response_locale))
         await self._chat_accounts.pair_account(
             mxid=mxid,
             discourse_username=updated.discourse_username,
@@ -309,9 +323,23 @@ class DischatService:
         if command_name == "pair" and len(args) == 1:
             requested_username = args[0]
             now = self._now()
-            retry_at = await self._issuance_retry_at(
-                mxid=account_mxid, discourse_username=requested_username, now=now
+            atomic_reserve = (
+                getattr(self._pairing_rate_limits, "reserve_issuance", None)
+                if self._pairing_rate_limits is not None
+                else None
             )
+            if atomic_reserve is not None:
+                retry_at = await atomic_reserve(
+                    mxid=account_mxid,
+                    discourse_username=requested_username,
+                    now=now,
+                    window=self._rate_limit_policy().issuance_window,
+                    max_issuances=self._rate_limit_policy().max_issuances_per_window,
+                )
+            else:
+                retry_at = await self._issuance_retry_at(
+                    mxid=account_mxid, discourse_username=requested_username, now=now
+                )
             if retry_at is not None:
                 return ServiceResponse(
                     body=translate_format(
@@ -321,7 +349,7 @@ class DischatService:
                     )
                 )
             session, raw_code = self._pairing_service.start_session(account_mxid, args[0])
-            if self._pairing_rate_limits is not None:
+            if self._pairing_rate_limits is not None and atomic_reserve is None:
                 await self._pairing_rate_limits.record_issuance(
                     mxid=account_mxid,
                     discourse_username=requested_username.lower(),

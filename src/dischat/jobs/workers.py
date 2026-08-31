@@ -15,6 +15,7 @@ from dischat.i18n import translate
 from dischat.security.audit import (
     ACTION_DM_DELIVERY,
     ACTION_ROOM_DELIVERY,
+    STATUS_FAILED,
     STATUS_PENDING,
     STATUS_SUCCESS,
     AuditEntry,
@@ -194,6 +195,8 @@ async def deliver_job(
     matrix_client: Any,
     delivery_jobs: DeliveryJobsRepo | None = None,
     audit_logs: AuditLogsRepo | None = None,
+    categories: Any | None = None,
+    live_e2e_category_id: int | None = None,
 ) -> WorkerResult:
     event = await discourse_events.get_by_id(job.event_id)
     if event is None:
@@ -207,9 +210,44 @@ async def deliver_job(
                 matrix_room_id=job.matrix_room_id,
                 success=False,
                 error_message="missing_discourse_event",
+                status=STATUS_FAILED,
             ),
         )
         return WorkerResult(complete=False, error="missing_discourse_event")
+    event_category_id = getattr(event, "category_id", None)
+    if categories is not None and isinstance(event_category_id, int):
+        category = await categories.get_by_discourse_category_id(event_category_id)
+        live_exception = live_e2e_category_id == 56 and event_category_id == 56
+        if (
+            category is None
+            or not category.enabled
+            or (not category.is_public and not live_exception)
+        ):
+            logger.warning(
+                "Suppressing job %s because category %s is no longer deliverable",
+                job.id,
+                event_category_id,
+            )
+            return WorkerResult(complete=True)
+    # Reconcile durable evidence of an earlier successful attempt before any
+    # device-id check. A rotated device must not strand a job whose mapping is
+    # already present.
+    if job.target_type == "room" and job.matrix_room_id is not None:
+        existing_mapping = await _find_existing_room_mapping(
+            delivery_messages=delivery_messages,
+            discourse_post_id=event.discourse_post_id,
+            matrix_room_id=job.matrix_room_id,
+        )
+        if existing_mapping is not None:
+            return WorkerResult(complete=True)
+    if job.target_type == "dm" and job.target_mxid is not None:
+        existing_mapping = await _find_existing_dm_mapping(
+            delivery_messages=delivery_messages,
+            discourse_post_id=event.discourse_post_id,
+            target_mxid=job.target_mxid,
+        )
+        if existing_mapping is not None:
+            return WorkerResult(complete=True)
     # Durable idempotency for the post-send/pre-persist window: stamp a stable
     # transaction id BEFORE the Matrix write. If the process dies after the
     # homeserver accepted the event but before create_mapping() persisted, the
@@ -229,7 +267,10 @@ async def deliver_job(
     # replacement access token), the job's durable tx id would no longer
     # deduplicate on the current device — refuse the send (fail closed)
     # instead of silently proceeding.
-    if delivery_jobs is not None and matrix_client.device_id:
+    if delivery_jobs is not None:
+        if not matrix_client.device_id:
+            logger.error("Refusing delivery of job %s: Matrix device id is unknown", job.id)
+            return WorkerResult(complete=False, error="matrix_device_unknown")
         stored_device_id = await delivery_jobs.ensure_matrix_device_id(
             job.id, device_id=matrix_client.device_id
         )
@@ -243,19 +284,6 @@ async def deliver_job(
                 matrix_client.device_id,
             )
             return WorkerResult(complete=False, error="matrix_device_mismatch")
-    if job.target_type == "room" and job.matrix_room_id is not None:
-        # At-least-once caveat: a prior attempt may have sent the message but died
-        # before persisting the mapping (crash between send and DB write, or lease
-        # expiry). If a mapping already exists for (post, room), the send went out;
-        # treat the job as complete instead of re-sending a duplicate.
-        existing_mapping = await _find_existing_room_mapping(
-            delivery_messages=delivery_messages,
-            discourse_post_id=event.discourse_post_id,
-            matrix_room_id=job.matrix_room_id,
-        )
-        if existing_mapping is not None:
-            return WorkerResult(complete=True)
-
     action = ACTION_ROOM_DELIVERY if job.target_type == "room" else ACTION_DM_DELIVERY
 
     result_room_id: str | None = None
@@ -366,16 +394,6 @@ async def deliver_job(
             return WorkerResult(complete=False, error="mapping_persistence_failed")
         return WorkerResult(complete=True)
     if job.target_type == "dm" and job.target_mxid is not None:
-        # At-least-once caveat, DM flavour: a prior attempt may have delivered this
-        # DM but died before persisting the mapping. Reconcile on (post, recipient)
-        # before sending — the send itself is the side effect we must not repeat.
-        existing_dm_mapping = await _find_existing_dm_mapping(
-            delivery_messages=delivery_messages,
-            discourse_post_id=event.discourse_post_id,
-            target_mxid=job.target_mxid,
-        )
-        if existing_dm_mapping is not None:
-            return WorkerResult(complete=True)
         account = await chat_accounts.get_by_mxid(job.target_mxid)
         locale = account.response_locale if account is not None else "en"
         body, formatted = _render_delivery_content(event.raw_payload_json, full_content=True)
@@ -390,15 +408,19 @@ async def deliver_job(
         if delivery_jobs is not None:
             pinned_room_id = await delivery_jobs.get_matrix_dm_room_id(job.id)
             if pinned_room_id is None:
-                pinned_room_id = await matrix_client.resolve_dm_room(job.target_mxid)
-                await delivery_jobs.pin_matrix_dm_room(job.id, room_id=pinned_room_id)
+                resolved_room_id = await matrix_client.resolve_dm_room(job.target_mxid)
+                # A concurrent worker may have won the pin with a different
+                # room. Always send to the repository's durable winner.
+                pinned_room_id = await delivery_jobs.pin_matrix_dm_room(
+                    job.id, room_id=resolved_room_id
+                )
         else:
             # Legacy call sites without a jobs repo: resolve without a pin.
             pinned_room_id = await matrix_client.resolve_dm_room(job.target_mxid)
         target_mxid = job.target_mxid
         result_room_id = pinned_room_id
         audit_log_id = await audit_attempt()
-        send_kwargs = {"formatted": formatted}
+        send_kwargs: dict[str, Any] = {"formatted": formatted}
         if matrix_tx_id is not None:
             send_kwargs["tx_id"] = matrix_tx_id
         try:
@@ -461,6 +483,7 @@ async def deliver_job(
             post_id=event.discourse_post_id,
             success=False,
             error_message="unsupported_delivery_target",
+            status=STATUS_FAILED,
         ),
     )
     return WorkerResult(complete=False, error="unsupported_delivery_target")

@@ -222,7 +222,7 @@ async def test_pairing_pm_failure_records_failed_audit_entry_and_reraises() -> N
     assert entry.action == ACTION_PAIRING_PM
     assert entry.success is False
     assert entry.error_message is not None
-    assert "pairing PM" in entry.error_message
+    assert entry.error_message == "RuntimeError"
     assert entry.discourse_username_used == "target_user"
 
 
@@ -253,7 +253,7 @@ async def test_discourse_reply_failure_records_failed_audit_entry_and_reraises()
     entry = audit.single()
     assert entry.action == ACTION_DISCOURSE_REPLY
     assert entry.success is False
-    assert entry.error_message == "RuntimeError: Discourse rejected the reply"
+    assert entry.error_message == "RuntimeError"
     assert entry.topic_id == 20
     assert entry.post_id is None
     assert entry.mxid == "@alice:aosus.org"
@@ -523,7 +523,7 @@ async def test_room_delivery_failure_records_failed_audit_entry_and_reraises() -
     entry = audit.single()
     assert entry.action == ACTION_ROOM_DELIVERY
     assert entry.success is False
-    assert entry.error_message == "RuntimeError: Matrix homeserver refused the send"
+    assert entry.error_message == "RuntimeError"
     assert entry.matrix_event_id is None
     assert entry.topic_id == 20
 
@@ -569,7 +569,7 @@ async def test_dm_delivery_failure_records_failed_audit_entry_and_reraises() -> 
     entry = audit.single()
     assert entry.action == ACTION_DM_DELIVERY
     assert entry.success is False
-    assert entry.error_message == "RuntimeError: Matrix homeserver refused the DM"
+    assert entry.error_message == "RuntimeError"
 
 
 async def test_missing_event_records_failed_audit_entry() -> None:

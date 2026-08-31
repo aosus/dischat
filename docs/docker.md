@@ -20,10 +20,14 @@ Choose an **external PostgreSQL instance** when you already operate one, need ma
 2. Start the bridge without its Compose dependencies:
 
    ```bash
-   docker compose up -d --no-deps dischat
+   POSTGRES_PASSWORD=external-database-unused \
+     docker compose up -d --no-deps dischat
    ```
 
-   `dischat` declares `depends_on` for the bundled `postgres` service, so without `--no-deps`, Compose would start the bundled database too. With `--no-deps`, only the bridge starts; no other change is required.
+   `dischat` declares `depends_on` for the bundled `postgres` service, so without
+   `--no-deps`, Compose would start the bundled database too. Compose interpolates
+   the full file before selecting services, so its required bundled-database
+   password must still receive a nonempty, unused placeholder as shown above.
 
 ## Development vs production database credentials
 

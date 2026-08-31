@@ -187,7 +187,11 @@ class FakeRoomLinks:
         self.replaced.append(room_links)
 
     async def list_links_matching_category(
-        self, category_slug: str, *, include_non_public: bool = False
+        self,
+        category_slug: str,
+        *,
+        category_id: int | None = None,
+        include_non_public: bool = False,
     ):
         return self.by_category.get(category_slug, [])
 

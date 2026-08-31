@@ -59,8 +59,8 @@ lease can lapse while the result was never recorded. This makes delivery
    mapping never persisted, the retry re-sends with the SAME transaction id and
    the homeserver deduplicates the event. Because Matrix scopes transaction ids
    to a single **device** and a single **HTTP endpoint**, two further columns
-   make this hold across restarts: the bot's stable `MATRIX_DEVICE_ID` is
-   required with password auth (a password re-login without it would mint a
+  make this hold across restarts: the bot's stable `MATRIX_DEVICE_ID` is
+   required and verified for every auth mode (a password re-login without it would mint a
    new device and invalidate the persisted ids), and the first resolved DM room
    is pinned on the job (`matrix_dm_room_id`) so a retry cannot send the same
    id to a different `/rooms/{roomId}/send` endpoint. With these in place the
@@ -104,24 +104,22 @@ Consequences:
 - processing the same event twice produces exactly one Discourse write;
 - a replay racing a live worker always loses the fence (the worker's lease is
   fresh) and never writes a second time;
-- if the process dies before the external write, a replay takes the fence
+- if the process dies while the marker is still `claimed`, a replay takes the fence
   over once the lease lapses and delivers the event exactly once;
 - if the process dies after the Discourse write and after the outcome was
   recorded but before the `delivery_messages` mapping is committed, the
   marker is reconciled from the recorded outcome: the reply is never written
   twice;
-- in-process failures before any external write (Discourse error responses)
-  release a fence the attempt still owns, so a later delivery of the same
-  event retries cleanly.
+- once an attempt enters an external write, its marker becomes `owned` and is
+  never automatically adopted or released; an ambiguous transport failure is
+  therefore at-most-once and requires operator reconciliation.
 
-Residual duplicate window: there is a gap between Discourse accepting the
-write and the outcome being durably recorded (recording the outcome is a
-separate ledger write that runs after the HTTP call returns). If the process
-dies inside that gap, the durable marker shows no outcome and, once the lease
-lapses, a replay performs the write again — Discourse offers no idempotency
-primitive that would let the bridge predict or dedupe the post beforehand. The
-fence therefore guarantees exactly-once side effects for every crash point
-except this one, where behavior is at-least-once with a bounded window.
+Ambiguous-write policy: there is a gap between entering a Discourse write and
+durably recording its outcome. Discourse offers no idempotency key for this
+operation, so the bridge chooses confidentiality/integrity over automatic
+availability: an `owned` marker is retained and never replayed. Alert on old
+`owned` rows, reconcile the remote side manually, then either record the
+outcome or explicitly remove the marker if the write is proven absent.
 
 Mixed-version rolling upgrade: while an old-version process (before the lease
 migration) still runs next to a new-version one, a pre-lease `claimed` marker

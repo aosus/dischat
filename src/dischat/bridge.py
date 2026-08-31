@@ -139,6 +139,10 @@ class MatrixEventStateRepo(Protocol):
         lease_seconds: int = ...,
     ) -> MatrixEventMarker | None: ...
 
+    async def begin_event_write(
+        self, *, matrix_room_id: str, matrix_event_id: str, lease_owner: str
+    ) -> bool: ...
+
     async def mark_event_written(
         self,
         *,
@@ -217,6 +221,7 @@ async def _reconcile_written_event(
         matrix_event_id=event_id,
     )
     if mapping is not None:
+        await event_state.mark_event_processed(matrix_room_id=room_id, matrix_event_id=event_id)
         return BridgeResult(posted=False, discourse_post_id=mapping.discourse_post_id)
 
     event = await event_state.get_event(matrix_room_id=room_id, matrix_event_id=event_id)
@@ -345,7 +350,7 @@ async def handle_matrix_reply(
             event = await event_state.get_event(
                 matrix_room_id=message.room_id, matrix_event_id=message.event_id
             )
-            if event is not None and event.status in ("claimed", "owned"):
+            if event is not None and event.status == "claimed":
                 # Exclusive takeover: the row transitions to the distinct
                 # 'owned' state under this attempt's lease token, so exactly
                 # one racing attempt can win. The repository only releases a
@@ -364,7 +369,7 @@ async def handle_matrix_reply(
                     # the takeover. It owns the event's side effects now.
                     return BridgeResult(posted=False, error_message="event_already_claimed")
                 # Fence taken over: fall through and deliver the event.
-            elif event is not None:
+            elif event is not None and event.status in ("written", "processed"):
                 # 'written'/'processed': the external write already happened
                 # and its outcome is recorded. Reconcile the mapping from the
                 # recorded outcome; never write to Discourse again.
@@ -374,6 +379,8 @@ async def handle_matrix_reply(
                     room_id=message.room_id,
                     event_id=message.event_id,
                 )
+            elif event is not None and event.status == "owned":
+                return BridgeResult(posted=False, error_message="event_write_ambiguous")
             else:
                 # No marker (e.g. deleted between the failed claim and this
                 # read). Re-seed the fence: reconcile would wrongly confirm
@@ -399,7 +406,7 @@ async def handle_matrix_reply(
         await _release_event_fence(
             event_state, room_id=message.room_id, event_id=message.event_id, lease_owner=lease_owner
         )
-        return BridgeResult(posted=False)
+        return BridgeResult(posted=False, error_message="parent_mapping_pending")
 
     account = await chat_accounts.ensure_account(
         mxid=message.sender,
@@ -500,6 +507,14 @@ async def handle_matrix_reply(
     # documented residual at-least-once window (docs/operations.md) applies
     # instead of a guaranteed duplicate.
     external_write_done = False
+    if event_state is not None and lease_owner is not None:
+        begin_write = getattr(event_state, "begin_event_write", None)
+        if begin_write is not None and not await begin_write(
+            matrix_room_id=message.room_id,
+            matrix_event_id=message.event_id,
+            lease_owner=lease_owner,
+        ):
+            return BridgeResult(posted=False, error_message="event_already_claimed")
     reply_audit_id = await record_audit_attempt(
         audit_logs,
         AuditEntry(
@@ -575,12 +590,9 @@ async def handle_matrix_reply(
             # residual at-least-once window applies. Releasing in this state
             # would invite a guaranteed duplicate write on replay.
             raise
-        # create_reply itself failed: no external write happened in this
-        # attempt, so release the fence (only while still holding the lease)
-        # so a later delivery retries cleanly.
-        await _release_event_fence(
-            event_state, room_id=message.room_id, event_id=message.event_id, lease_owner=lease_owner
-        )
+        # Transport failures are ambiguous: the server may have committed the
+        # reply before the connection failed. ``owned`` is intentionally not
+        # releasable or adoptable, preventing an automatic duplicate.
         raise
 
     if event_state is not None:

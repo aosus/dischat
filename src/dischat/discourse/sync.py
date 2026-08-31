@@ -166,12 +166,13 @@ async def poll_once(
         if isinstance(raw_category_id, int | str):
             discourse_category_id = int(raw_category_id)
         include_non_public_category = False
-        if discourse_category_id is None and live_e2e_category_id is not None:
-            # Live-E2E mode reads a single category feed; tolerate payloads missing category_id.
-            discourse_category_id = live_e2e_category_id
         if discourse_category_id is None:
             continue
-        if live_e2e_category_id is not None and discourse_category_id == live_e2e_category_id:
+        if live_e2e_category_id is not None:
+            # The live feed is a strict, single-category test fixture. Never
+            # route an unexpected category returned by that endpoint.
+            if discourse_category_id != live_e2e_category_id:
+                continue
             include_non_public_category = True
         else:
             category_record = await categories.get_by_discourse_category_id(discourse_category_id)

@@ -131,14 +131,11 @@ Audit policy:
   attempt regardless of outcome; failures use the same action name with
   `success = FALSE`.
 - **Failure reasons are stored without secrets.** `error_message` contains a
-  stable reason token (for example `missing_discourse_event`) or the exception
-  class name plus redacted exception text, truncated to 200 characters on one
-  line. Exception text is never persisted verbatim: before truncation it is
-  redacted for secret-bearing shapes (API keys, tokens, passwords, bearer
-  tokens, pairing codes); every `http(s)://` URL is reduced to scheme + host
-  with its path and query replaced, so credentials embedded in URLs or query
-  strings cannot leak. Pairing codes and their hashes, API keys, access
-  tokens, and message bodies never enter `audit_logs`.
+  stable reason token (for example `missing_discourse_event`) or only the
+  exception class name. Arbitrary exception text is never persisted because
+  it can echo request bodies or credentials in shapes no regex can safely
+  enumerate. Pairing codes and their hashes, API keys, access tokens, and
+  message bodies never enter `audit_logs`.
 - **Coverage is enforced structurally.** Migration
   `0005_audit_write_paths.sql` adds an `action <> ''` check constraint plus
   `(created_at)` and `(success, created_at)` indexes for triage queries, and

@@ -166,7 +166,11 @@ class FakeRoomLinks:
         return self.by_room.get(matrix_room_id, self.room_link)
 
     async def list_links_matching_category(
-        self, category_slug: str, *, include_non_public: bool = False
+        self,
+        category_slug: str,
+        *,
+        category_id: int | None = None,
+        include_non_public: bool = False,
     ) -> list[RoomLinkRecord]:
         self.matching_calls.append(
             {"category_slug": category_slug, "include_non_public": include_non_public}

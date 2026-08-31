@@ -10,6 +10,7 @@ import asyncpg
 
 from dischat.security.audit import (
     STATUS_FAILED,
+    STATUS_PENDING,
     STATUS_SUCCESS,
     AuditEntry,
 )
@@ -351,7 +352,12 @@ class PairingSessionRepository:
         async with self._pool.acquire() as connection:
             async with connection.transaction():
                 await connection.execute(
-                    "DELETE FROM pairing_sessions WHERE mxid = $1 AND consumed_at IS NULL", mxid
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", mxid
+                )
+                await connection.execute(
+                    "UPDATE pairing_sessions SET consumed_at = NOW() "
+                    "WHERE mxid = $1 AND consumed_at IS NULL",
+                    mxid,
                 )
                 row = await connection.fetchrow(
                     """
@@ -388,33 +394,31 @@ class PairingSessionRepository:
             )
         return _record_to_pairing_session(row) if row is not None else None
 
-    async def increment_attempt_count(self, session_id: int) -> PairingSessionRecord:
+    async def increment_attempt_count(self, session_id: int) -> PairingSessionRecord | None:
         async with self._pool.acquire() as connection:
             row = await connection.fetchrow(
                 """
                 UPDATE pairing_sessions
                 SET attempt_count = attempt_count + 1
-                WHERE id = $1
+                WHERE id = $1 AND consumed_at IS NULL
                 RETURNING *
                 """,
                 session_id,
             )
-        assert row is not None
-        return _record_to_pairing_session(row)
+        return _record_to_pairing_session(row) if row is not None else None
 
-    async def consume_session(self, session_id: int) -> PairingSessionRecord:
+    async def consume_session(self, session_id: int) -> PairingSessionRecord | None:
         async with self._pool.acquire() as connection:
             row = await connection.fetchrow(
                 """
                 UPDATE pairing_sessions
                 SET consumed_at = NOW()
-                WHERE id = $1
+                WHERE id = $1 AND consumed_at IS NULL
                 RETURNING *
                 """,
                 session_id,
             )
-        assert row is not None
-        return _record_to_pairing_session(row)
+        return _record_to_pairing_session(row) if row is not None else None
 
     async def cancel_session(self, mxid: str) -> None:
         async with self._pool.acquire() as connection:
@@ -437,6 +441,105 @@ class PairingRateLimitRepository:
 
     def __init__(self, pool: asyncpg.Pool) -> None:
         self._pool = pool
+
+    async def reserve_issuance(
+        self,
+        *,
+        mxid: str,
+        discourse_username: str,
+        now: datetime,
+        window: timedelta,
+        max_issuances: int,
+    ) -> datetime | None:
+        """Atomically reserve both user and target rolling-window capacity."""
+        target = discourse_username.lower()
+        cutoff = now - window
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", mxid
+                )
+                await connection.execute(
+                    "DELETE FROM pairing_issuance_events WHERE mxid = $1 AND issued_at <= $2",
+                    mxid,
+                    cutoff,
+                )
+                rows = await connection.fetch(
+                    """
+                    SELECT discourse_username, COUNT(*) AS count, MIN(issued_at) AS oldest
+                    FROM pairing_issuance_events
+                    WHERE mxid = $1 AND discourse_username = ANY($2::text[])
+                    GROUP BY discourse_username
+                    """,
+                    mxid,
+                    ["", target],
+                )
+                by_scope = {row["discourse_username"]: row for row in rows}
+                blocked = [row for row in by_scope.values() if row["count"] >= max_issuances]
+                if blocked:
+                    return max(row["oldest"] + window for row in blocked)
+                await connection.executemany(
+                    "INSERT INTO pairing_issuance_events "
+                    "(mxid, discourse_username, issued_at) VALUES ($1, $2, $3)",
+                    [(mxid, "", now), (mxid, target, now)],
+                )
+        return None
+
+    async def record_failure_and_apply_cooldown(
+        self,
+        *,
+        mxid: str,
+        discourse_username: str,
+        now: datetime,
+        max_failures: int,
+        cooldown: timedelta,
+    ) -> datetime | None:
+        """Update user and target failure scopes in one locked transaction."""
+        target = discourse_username.lower()
+        armed_until: datetime | None = None
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", mxid
+                )
+                for username in (None, target):
+                    row = await connection.fetchrow(
+                        """
+                        INSERT INTO pairing_rate_limits
+                            (mxid, discourse_username, failure_count, updated_at)
+                        VALUES ($1, $2, 1, $3)
+                        ON CONFLICT (mxid, COALESCE(discourse_username, '')) DO UPDATE SET
+                            failure_count = CASE
+                                WHEN pairing_rate_limits.cooldown_until IS NOT NULL
+                                 AND pairing_rate_limits.cooldown_until <= $3 THEN 1
+                                ELSE pairing_rate_limits.failure_count + 1 END,
+                            updated_at = $3
+                        RETURNING failure_count, cooldown_until
+                        """,
+                        mxid,
+                        username,
+                        now,
+                    )
+                    assert row is not None
+                    active = row["cooldown_until"] is not None and now < row["cooldown_until"]
+                    if row["failure_count"] >= max_failures and not active:
+                        candidate = now + cooldown
+                        await connection.execute(
+                            """
+                            UPDATE pairing_rate_limits
+                            SET failure_count = 0,
+                                cooldown_until = GREATEST(COALESCE(cooldown_until, $3), $3),
+                                updated_at = $4
+                            WHERE mxid = $1
+                              AND COALESCE(discourse_username, '') = COALESCE($2, '')
+                            """,
+                            mxid,
+                            username,
+                            candidate,
+                            now,
+                        )
+                        armed_until = max(armed_until or candidate, candidate)
+        return armed_until
 
     @staticmethod
     def _record_to_state(row: asyncpg.Record) -> PairingRateLimitState:
@@ -842,7 +945,11 @@ class RoomLinkRepository:
         )
 
     async def list_links_matching_category(
-        self, category_slug: str, *, include_non_public: bool = False
+        self,
+        category_slug: str,
+        *,
+        category_id: int | None = None,
+        include_non_public: bool = False,
     ) -> list[RoomLinkRecord]:
         async with self._pool.acquire() as connection:
             rows = await connection.fetch(
@@ -864,7 +971,8 @@ class RoomLinkRepository:
                           rl.include_all_public_categories = TRUE
                           AND EXISTS (
                               SELECT 1 FROM categories tc
-                              WHERE tc.slug = $1
+                              WHERE (($3::bigint IS NOT NULL AND tc.id = $3) OR
+                                     ($3::bigint IS NULL AND tc.slug = $1))
                                 -- include_all_public_categories rooms must never be
                                 -- unlocked by include_non_public: the live-E2E escape
                                 -- hatch authorizes only the explicitly configured
@@ -873,12 +981,14 @@ class RoomLinkRepository:
                                 AND tc.is_public = TRUE AND tc.enabled = TRUE
                           )
                         )
-                        OR c.slug = $1
+                        OR (($3::bigint IS NOT NULL AND c.id = $3) OR
+                            ($3::bigint IS NULL AND c.slug = $1))
                   )
                 ORDER BY rl.id, c.slug
                 """,
                 category_slug,
                 include_non_public,
+                category_id,
             )
         grouped: dict[int, RoomLinkRecord] = {}
         category_map: dict[int, list[str]] = {}
@@ -1336,6 +1446,13 @@ class AuditLogRepository:
         self._pool = pool
 
     async def record(self, entry: AuditEntry) -> int | None:
+        status = entry.status
+        if entry.success is False:
+            status = STATUS_FAILED
+        elif entry.success is True:
+            status = STATUS_SUCCESS
+        elif entry.success is None:
+            status = STATUS_PENDING
         async with self._pool.acquire() as connection:
             row = await connection.fetchrow(
                 """
@@ -1368,7 +1485,7 @@ class AuditLogRepository:
                 entry.matrix_event_id,
                 entry.success,
                 entry.error_message,
-                entry.status,
+                status,
                 datetime.now(UTC),
             )
         if row is None:
@@ -1386,7 +1503,7 @@ class AuditLogRepository:
         matrix_room_id: str | None = None,
     ) -> None:
         async with self._pool.acquire() as connection:
-            await connection.execute(
+            row = await connection.fetchrow(
                 """
                 UPDATE audit_logs
                 SET success = $2,
@@ -1395,7 +1512,8 @@ class AuditLogRepository:
                     post_id = COALESCE($5, post_id),
                     matrix_event_id = COALESCE($6, matrix_event_id),
                     matrix_room_id = COALESCE($7, matrix_room_id)
-                WHERE id = $1
+                WHERE id = $1 AND status = 'pending'
+                RETURNING id
                 """,
                 audit_log_id,
                 success,
@@ -1405,6 +1523,8 @@ class AuditLogRepository:
                 matrix_event_id,
                 matrix_room_id,
             )
+        if row is None:
+            raise RuntimeError("audit outcome row is missing or already resolved")
 
 
 class MatrixStateRepository:
@@ -1520,7 +1640,7 @@ class MatrixStateRepository:
                     lease_expires_at = NOW() + make_interval(secs => $4::double precision),
                     updated_at = NOW()
                 WHERE room_id = $1 AND event_id = $2
-                  AND status IN ('claimed', 'owned')
+                  AND status = 'claimed'
                   AND (
                       lease_expires_at IS NULL
                       OR lease_expires_at <= NOW()
@@ -1534,6 +1654,34 @@ class MatrixStateRepository:
                 lease_seconds,
             )
         return _record_to_matrix_event_state(row) if row is not None else None
+
+    async def begin_event_write(
+        self,
+        *,
+        matrix_room_id: str,
+        matrix_event_id: str,
+        lease_owner: str,
+        lease_seconds: int = DEFAULT_LEASE_SECONDS,
+    ) -> bool:
+        """Enter the ambiguous external-write region under the current lease."""
+        async with self._pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                UPDATE matrix_event_state
+                SET status = 'owned',
+                    lease_expires_at = NOW() + make_interval(secs => $4::double precision),
+                    updated_at = NOW()
+                WHERE room_id = $1 AND event_id = $2
+                  AND status IN ('claimed', 'owned')
+                  AND lease_owner = $3
+                RETURNING id
+                """,
+                matrix_room_id,
+                matrix_event_id,
+                lease_owner,
+                lease_seconds,
+            )
+        return row is not None
 
     async def mark_event_written(
         self,
@@ -1573,7 +1721,7 @@ class MatrixStateRepository:
                     response_notice = COALESCE($5, response_notice),
                     updated_at = NOW()
                 WHERE room_id = $1 AND event_id = $2
-                  AND status IN ('claimed', 'owned')
+                  AND status = 'claimed'
                   AND ($6::text IS NULL OR lease_owner = $6::text)
                 RETURNING discourse_topic_id, discourse_post_id
                 """,

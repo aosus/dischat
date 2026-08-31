@@ -132,12 +132,10 @@ def failure_reason(exc: BaseException) -> str:
     truncation. The exception class name is always preserved as the stable
     prefix so triage does not depend on exception text surviving redaction.
     """
-    reason = _redact_secrets(str(exc).strip())
-    if not reason:
-        reason = exc.__class__.__name__
-    else:
-        reason = f"{exc.__class__.__name__}: {reason}"
-    return reason.replace("\n", " ")[:_ERROR_MESSAGE_MAX_LENGTH]
+    # Exception messages can echo arbitrary request bodies and credentials;
+    # regex redaction can never prove such text safe. Persist only the stable
+    # exception class. Full diagnostics remain in ephemeral application logs.
+    return exc.__class__.__name__[:_ERROR_MESSAGE_MAX_LENGTH]
 
 
 async def record_audit_entry(
