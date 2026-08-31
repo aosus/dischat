@@ -37,6 +37,8 @@ async def pg_pool(database_url: str) -> AsyncIterator[asyncpg.Pool]:
     async with pool.acquire() as connection:
         for table in [
             "audit_logs",
+            "matrix_event_state",
+            "matrix_sync_state",
             "delivery_messages",
             "delivery_jobs",
             "discourse_events",
