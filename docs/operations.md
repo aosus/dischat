@@ -8,3 +8,4 @@ Recommended operational tasks:
 - monitor failed delivery jobs
 - rotate secrets outside the repository
 - keep the bot invited to target rooms and DM targets
+- back up the database regularly (see [Docker: Data persistence & backups](docker.md#data-persistence-backups))
