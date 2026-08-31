@@ -18,11 +18,13 @@ from dischat.subscriptions.bootstrap import (
 
 logger = logging.getLogger(__name__)
 
+
 def _job_lease_seconds(context) -> int:
     """Lease duration for claimed jobs, configurable via DELIVERY_JOB_LEASE_SECONDS."""
     settings = getattr(context, "settings", None)
     configured = getattr(settings, "delivery_job_lease_seconds", DEFAULT_JOB_LEASE_SECONDS)
     return int(configured)
+
 
 async def drain_delivery_jobs(context) -> int:
     delivered = 0
