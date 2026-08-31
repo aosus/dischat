@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 import asyncpg
@@ -38,6 +38,16 @@ class PairingSessionRecord:
     expires_at: datetime
     consumed_at: datetime | None
     attempt_count: int
+
+
+@dataclass(slots=True)
+class PairingRateLimitState:
+    mxid: str
+    discourse_username: str | None
+    issuance_count: int
+    failure_count: int
+    window_started_at: datetime
+    cooldown_until: datetime | None
 
 
 @dataclass(slots=True, frozen=True)
@@ -363,6 +373,141 @@ class PairingSessionRepository:
                 """,
                 mxid,
             )
+
+
+class PairingRateLimitRepository:
+    """Persistent pairing rate-limit counters that survive session replacement.
+
+    State is keyed by (mxid, discourse_username) so limits hold even when a new
+    pairing session replaces the previous unconsumed one.
+    """
+
+    def __init__(self, pool: asyncpg.Pool) -> None:
+        self._pool = pool
+
+    @staticmethod
+    def _record_to_state(row: asyncpg.Record) -> PairingRateLimitState:
+        return PairingRateLimitState(
+            mxid=row["mxid"],
+            discourse_username=row["discourse_username"],
+            issuance_count=row["issuance_count"],
+            failure_count=row["failure_count"],
+            window_started_at=row["window_started_at"],
+            cooldown_until=row["cooldown_until"],
+        )
+
+    async def get_state(
+        self, *, mxid: str, discourse_username: str | None
+    ) -> PairingRateLimitState | None:
+        async with self._pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT * FROM pairing_rate_limits
+                WHERE mxid = $1 AND COALESCE(discourse_username, '') = COALESCE($2, '')
+                """,
+                mxid,
+                discourse_username,
+            )
+        return self._record_to_state(row) if row is not None else None
+
+    async def record_issuance(
+        self,
+        *,
+        mxid: str,
+        discourse_username: str | None,
+        now: datetime,
+        window: timedelta,
+    ) -> PairingRateLimitState:
+        async with self._pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                INSERT INTO pairing_rate_limits (
+                    mxid, discourse_username, issuance_count, window_started_at, updated_at
+                )
+                VALUES ($1, $2, 1, $3::timestamptz, $3::timestamptz)
+                ON CONFLICT (mxid, COALESCE(discourse_username, '')) DO UPDATE SET
+                    issuance_count =
+                        CASE
+                            WHEN pairing_rate_limits.window_started_at <= $3::timestamptz - $4::interval
+                            THEN 1
+                            ELSE pairing_rate_limits.issuance_count + 1
+                        END,
+                    window_started_at =
+                        CASE
+                            WHEN pairing_rate_limits.window_started_at <= $3::timestamptz - $4::interval
+                            THEN $3::timestamptz
+                            ELSE pairing_rate_limits.window_started_at
+                        END,
+                    updated_at = $3::timestamptz
+                RETURNING *
+                """,
+                mxid,
+                discourse_username,
+                now,
+                window,
+            )
+        assert row is not None
+        return self._record_to_state(row)
+
+    async def record_failure(
+        self,
+        *,
+        mxid: str,
+        discourse_username: str | None,
+        now: datetime,
+    ) -> PairingRateLimitState:
+        async with self._pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                INSERT INTO pairing_rate_limits (mxid, discourse_username, failure_count, updated_at)
+                VALUES ($1, $2, 1, $3::timestamptz)
+                ON CONFLICT (mxid, COALESCE(discourse_username, '')) DO UPDATE SET
+                    failure_count = pairing_rate_limits.failure_count + 1,
+                    updated_at = $3::timestamptz
+                RETURNING *
+                """,
+                mxid,
+                discourse_username,
+                now,
+            )
+        assert row is not None
+        return self._record_to_state(row)
+
+    async def apply_cooldown(
+        self,
+        *,
+        mxid: str,
+        discourse_username: str | None,
+        cooldown_until: datetime,
+        now: datetime,
+        reset_failure_count: bool = False,
+    ) -> None:
+        """Arm (or extend) the cooldown; optionally reset the failure counter.
+
+        Resetting on re-arm gives each cooldown a fresh threshold: the next
+        cooldown requires ``max_failures`` new failures after the previous one
+        expired, instead of the stale counter re-triggering instantly.
+        """
+        async with self._pool.acquire() as connection:
+            await connection.execute(
+                """
+                INSERT INTO pairing_rate_limits
+                    (mxid, discourse_username, cooldown_until, updated_at)
+                VALUES ($1, $2, $4::timestamptz, $3::timestamptz)
+                ON CONFLICT (mxid, COALESCE(discourse_username, '')) DO UPDATE SET
+                    cooldown_until = EXCLUDED.cooldown_until,
+                    failure_count =
+                        CASE WHEN $5::bool THEN 0
+                             ELSE pairing_rate_limits.failure_count END,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                mxid,
+                discourse_username,
+                now,
+                cooldown_until,
+                reset_failure_count,
+            )
+        return None
 
 
 class CategoryRepository:
