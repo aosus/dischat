@@ -47,6 +47,8 @@ class DeliveryJobsRepo(Protocol):
         matrix_room_id: str | None,
     ) -> None: ...
 
+    async def list_room_ids_for_discourse_post(self, *, discourse_post_id: int) -> list[str]: ...
+
 
 async def route_event(
     *,
@@ -99,6 +101,24 @@ async def route_event(
                 matrix_room_id=mapping.matrix_room_id,
             )
         if mappings:
+            return
+        # The parent and child can appear in the same Discourse poll. In that
+        # case the parent's delivery job exists but has not run yet, so there
+        # is no Matrix mapping to follow. Mirror the parent's queued room
+        # targets; FIFO draining delivers the parent first, after which the
+        # child worker resolves the newly persisted parent mapping and sends a
+        # real Matrix reply instead of dropping the child permanently.
+        pending_parent_rooms = await delivery_jobs.list_room_ids_for_discourse_post(
+            discourse_post_id=reply_to_post_id
+        )
+        for matrix_room_id in pending_parent_rooms:
+            await delivery_jobs.enqueue(
+                event_id=event_id,
+                target_type="room",
+                target_mxid=None,
+                matrix_room_id=matrix_room_id,
+            )
+        if pending_parent_rooms:
             return
     if discourse_event.target_discourse_username is not None:
         for account in await chat_accounts.list_by_discourse_username(

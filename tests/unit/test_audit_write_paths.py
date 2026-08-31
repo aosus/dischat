@@ -131,7 +131,9 @@ class StubMatrixClient:
     def extract_messages(self, sync_response: Any) -> list[MatrixMessage]:
         return self._messages
 
-    async def send_notice(self, room_id: str, body: str) -> MatrixSendResult:
+    async def send_notice(
+        self, room_id: str, body: str, *, tx_id: str | None = None
+    ) -> MatrixSendResult:
         self.notices.append((room_id, body))
         return MatrixSendResult(event_id="$notice", room_id=room_id)
 
@@ -324,7 +326,9 @@ class StubBridgeDeliveryMessages:
 
     async def get_by_matrix_event(
         self, *, matrix_room_id: str, matrix_event_id: str
-    ) -> DeliveryMessageRecord:
+    ) -> DeliveryMessageRecord | None:
+        if matrix_event_id != "$parent":
+            return None
         return DeliveryMessageRecord(
             id=1,
             discourse_topic_id=20,
@@ -355,7 +359,9 @@ class StubReplyMatrix:
     def __init__(self) -> None:
         self.notices: list[tuple[str, str]] = []
 
-    async def send_notice(self, room_id: str, body: str) -> MatrixSendResult:
+    async def send_notice(
+        self, room_id: str, body: str, *, tx_id: str | None = None
+    ) -> MatrixSendResult:
         self.notices.append((room_id, body))
         return MatrixSendResult(event_id="$notice", room_id=room_id)
 
@@ -451,7 +457,9 @@ class StubWorkerMatrix:
         self.fail_send_dm = fail_send_dm
         self.dm_result_room_id = dm_result_room_id
 
-    async def send_notice(self, room_id: str, body: str) -> MatrixSendResult:
+    async def send_notice(
+        self, room_id: str, body: str, *, tx_id: str | None = None
+    ) -> MatrixSendResult:
         return MatrixSendResult(event_id="$stub_notice", room_id=room_id)
 
     async def send_reply(

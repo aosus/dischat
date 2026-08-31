@@ -3,15 +3,14 @@ services:
     image: postgres:17
     environment:
       POSTGRES_DB: dischat
-      POSTGRES_USER: dischat
-      # Required. Copied .env.example provides the dev-only example value;
-      # production MUST set a strong secret in .env before first startup.
-      # Compose fails fast here if it is unset or empty.
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env - the 'dischat' example is dev-only}
+      POSTGRES_USER: dischat_admin
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?set POSTGRES_ADMIN_PASSWORD in .env}
+      DISCHAT_DB_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres/init-runtime-user.sh:/docker-entrypoint-initdb.d/10-runtime-user.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U dischat -d dischat"]
+      test: ["CMD-SHELL", "pg_isready -U dischat_admin -d dischat"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -22,6 +21,12 @@ services:
     build: .
     env_file:
       - .env
+    environment:
+      # `.env` is also Compose's interpolation source for the bootstrap DB.
+      # Never expose the PostgreSQL superuser password to the application.
+      POSTGRES_ADMIN_PASSWORD: ""
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
     depends_on:
       postgres:
         condition: service_healthy

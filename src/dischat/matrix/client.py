@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Any, ClassVar, Protocol
 
@@ -20,6 +21,12 @@ from nio import (
 )
 
 from dischat.matrix.formatting import plain_notice, plain_text, reply_message, rich_text
+
+
+def event_notice_tx_id(room_id: str, event_id: str) -> str:
+    """Return a stable Matrix transaction id for one inbound-event notice."""
+    digest = hashlib.sha256(f"{room_id}\0{event_id}\0notice".encode()).hexdigest()
+    return f"dischat-notice-{digest}"
 
 
 @dataclass(slots=True, frozen=True)
@@ -50,7 +57,9 @@ class MatrixClient(Protocol):
         tx_id: str | None = None,
     ) -> MatrixSendResult: ...
 
-    async def send_notice(self, room_id: str, body: str) -> MatrixSendResult: ...
+    async def send_notice(
+        self, room_id: str, body: str, *, tx_id: str | None = None
+    ) -> MatrixSendResult: ...
 
     async def send_reply(
         self,
@@ -94,6 +103,7 @@ class NioMatrixClient:
             device_id=device_id,
             config=AsyncClientConfig(
                 max_limit_exceeded=0,
+                max_timeouts=3,
                 request_timeout=30,
             ),
         )
@@ -180,8 +190,12 @@ class NioMatrixClient:
                 if isinstance(event, InviteMemberEvent) and event.state_key == self.user_id:
                     await self._client.join(room_id)
 
-    async def send_notice(self, room_id: str, body: str) -> MatrixSendResult:
-        response = await self._client.room_send(room_id, "m.room.message", plain_notice(body))
+    async def send_notice(
+        self, room_id: str, body: str, *, tx_id: str | None = None
+    ) -> MatrixSendResult:
+        response = await self._client.room_send(
+            room_id, "m.room.message", plain_notice(body), tx_id=tx_id
+        )
         if not isinstance(response, RoomSendResponse):
             raise ValueError(f"Matrix send_notice failed: {response}")
         return MatrixSendResult(event_id=response.event_id, room_id=room_id)

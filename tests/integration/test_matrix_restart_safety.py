@@ -70,12 +70,20 @@ class FakeDiscourseWriteResult:
 class FakeNoticeMatrixClient:
     def __init__(self) -> None:
         self.notices: list[tuple[str, str]] = []
+        self.notice_results_by_tx_id: dict[str, MatrixSendResult] = {}
         self.extract_messages_return: list[MatrixMessage] = []
         self.user_id = "@bridge:aosus.org"
 
-    async def send_notice(self, room_id: str, body: str) -> MatrixSendResult:
+    async def send_notice(
+        self, room_id: str, body: str, *, tx_id: str | None = None
+    ) -> MatrixSendResult:
+        if tx_id is not None and tx_id in self.notice_results_by_tx_id:
+            return self.notice_results_by_tx_id[tx_id]
         self.notices.append((room_id, body))
-        return MatrixSendResult(event_id="$notice", room_id=room_id)
+        result = MatrixSendResult(event_id="$notice", room_id=room_id)
+        if tx_id is not None:
+            self.notice_results_by_tx_id[tx_id] = result
+        return result
 
     def extract_messages(self, sync_response) -> list[MatrixMessage]:
         return self.extract_messages_return
@@ -88,10 +96,13 @@ class CrashDuringNoticeMatrixClient(FakeNoticeMatrixClient):
         super().__init__()
         self.crash_on_notice = True
 
-    async def send_notice(self, room_id: str, body: str) -> MatrixSendResult:
+    async def send_notice(
+        self, room_id: str, body: str, *, tx_id: str | None = None
+    ) -> MatrixSendResult:
+        result = await super().send_notice(room_id, body, tx_id=tx_id)
         if self.crash_on_notice:
             raise RuntimeError("simulated crash after the external write")
-        return await super().send_notice(room_id, body)
+        return result
 
 
 class FakeDiscoursePrivateMessages:
@@ -273,6 +284,15 @@ async def test_replay_after_completed_write_reports_existing_post(pg_pool) -> No
         relay_telegram_username="TelegramRelayUser",
         relay_discord_username="DiscordRelayUser",
     )
+    # Simulate retention/operator cleanup removing the replay marker while the
+    # durable Matrix-event mapping remains. The mapping must prevent a fresh
+    # claim from reopening the Discourse write.
+    async with pg_pool.acquire() as connection:
+        await connection.execute(
+            "DELETE FROM matrix_event_state WHERE room_id = $1 AND event_id = $2",
+            message.room_id,
+            message.event_id,
+        )
     replay = await handle_matrix_reply(
         message=message,
         discourse_client=discourse,
@@ -290,10 +310,65 @@ async def test_replay_after_completed_write_reports_existing_post(pg_pool) -> No
     assert first.posted is True
     assert replay.discourse_post_id == first.discourse_post_id
     assert replay.error_message is None
+    assert len(discourse.calls) == 1
 
 
-async def test_failed_discourse_write_releases_fence_so_retry_can_succeed(pg_pool) -> None:
-    """In-process failures (no write committed) must not leave a permanent fence."""
+async def test_existing_mapping_reconciles_ambiguous_event_marker(pg_pool) -> None:
+    await apply_sql_migrations(pg_pool, MIGRATIONS_DIR)
+    delivery_messages = FakeDeliveryMessages()
+    matrix_state = MatrixStateRepository(pg_pool)
+    discourse = FakeDiscourseClient()
+    message = make_reply_message("$mapped-owned-event")
+
+    first = await handle_matrix_reply(
+        message=message,
+        discourse_client=discourse,
+        matrix_client=FakeNoticeMatrixClient(),
+        chat_accounts=FakeChatAccounts(),
+        room_links=FakeRoomLinks(None),
+        delivery_messages=delivery_messages,
+        audit_logs=FakeAuditLogs(),
+        event_state=matrix_state,
+        relay_matrix_username="MatrixRelayUser",
+        relay_telegram_username="TelegramRelayUser",
+        relay_discord_username="DiscordRelayUser",
+    )
+    assert first.posted is True
+    async with pg_pool.acquire() as connection:
+        await connection.execute(
+            """
+            UPDATE matrix_event_state
+            SET status = 'owned', lease_owner = 'dead-owner'
+            WHERE room_id = $1 AND event_id = $2
+            """,
+            message.room_id,
+            message.event_id,
+        )
+
+    replay = await handle_matrix_reply(
+        message=message,
+        discourse_client=discourse,
+        matrix_client=FakeNoticeMatrixClient(),
+        chat_accounts=FakeChatAccounts(),
+        room_links=FakeRoomLinks(None),
+        delivery_messages=delivery_messages,
+        audit_logs=FakeAuditLogs(),
+        event_state=matrix_state,
+        relay_matrix_username="MatrixRelayUser",
+        relay_telegram_username="TelegramRelayUser",
+        relay_discord_username="DiscordRelayUser",
+    )
+
+    assert replay.discourse_post_id == first.discourse_post_id
+    assert len(discourse.calls) == 1
+    marker = await matrix_state.get_event(
+        matrix_room_id=message.room_id, matrix_event_id=message.event_id
+    )
+    assert marker is not None and marker.status == "processed"
+
+
+async def test_ambiguous_discourse_transport_failure_keeps_owned_fence(pg_pool) -> None:
+    """A transport exception cannot prove that Discourse committed nothing."""
     from typing import cast
 
     from dischat.bridge import DiscourseReplyWriter
@@ -330,16 +405,18 @@ async def test_failed_discourse_write_releases_fence_so_retry_can_succeed(pg_poo
     else:
         raise AssertionError("expected the Discourse failure to propagate")
 
-    # The fence was released, so a later attempt writes exactly once.
+    # The fence remains owned, so a later attempt fails closed instead of
+    # risking a duplicate reply.
     healthy = FakeDiscourseClient()
     recovered = await handle_matrix_reply(discourse_client=healthy, **call_kwargs)
 
-    assert recovered.posted is True
-    assert len(healthy.calls) == 1
+    assert recovered.posted is False
+    assert recovered.error_message == "event_write_ambiguous"
+    assert len(healthy.calls) == 0
     marker = await matrix_state.get_event(
         matrix_room_id="!room:test", matrix_event_id=message.event_id
     )
-    assert marker is not None and marker.status == "processed"
+    assert marker is not None and marker.status == "owned"
 
 
 async def test_bridge_failure_after_external_write_does_not_release_fence(pg_pool) -> None:
@@ -349,10 +426,7 @@ async def test_bridge_failure_after_external_write_does_not_release_fence(pg_poo
     Discourse write completed, releasing the marker would let a replay claim
     the event and write a guaranteed duplicate. The fence must stay standing
     — either the recorded outcome makes it 'written' (replay reconciles), or
-    the residual at-least-once window (docs/operations.md) applies instead of
-    a guaranteed duplicate. Contrast
-    test_failed_discourse_write_releases_fence_so_retry_can_succeed, where the
-    write itself failed and release is correct.
+    an `owned` marker fails closed for operator reconciliation.
     """
     from typing import cast as _cast
 
@@ -470,7 +544,7 @@ async def test_sync_token_survives_restart(pg_pool) -> None:
         chat_accounts=None,
         room_links=None,
         delivery_messages=None,
-        audit_logs=None,
+        audit_logs=FakeAuditLogs(),
         categories=None,
         discourse_events=None,
         user_watches=None,
@@ -494,7 +568,7 @@ async def test_sync_token_survives_restart(pg_pool) -> None:
         chat_accounts=None,
         room_links=None,
         delivery_messages=None,
-        audit_logs=None,
+        audit_logs=FakeAuditLogs(),
         categories=None,
         discourse_events=None,
         user_watches=None,
@@ -512,6 +586,19 @@ async def test_sync_token_survives_restart(pg_pool) -> None:
     assert resumed_since == "batch-after-first"
     assert restarted_client.sync_calls[0]["since"] == "batch-after-first"
     assert await matrix_state.get_sync_next_batch() == "batch-after-second"
+
+
+async def test_discourse_poll_cursor_survives_restart_and_never_moves_backwards(pg_pool) -> None:
+    await apply_sql_migrations(pg_pool, MIGRATIONS_DIR)
+    matrix_state = MatrixStateRepository(pg_pool)
+
+    assert await matrix_state.get_discourse_last_seen_post_id() is None
+    await matrix_state.set_discourse_last_seen_post_id(125)
+    assert await matrix_state.get_discourse_last_seen_post_id() == 125
+
+    # A delayed/stale worker cannot rewind the shared high-water mark.
+    await matrix_state.set_discourse_last_seen_post_id(120)
+    assert await matrix_state.get_discourse_last_seen_post_id() == 125
 
 
 async def test_claim_release_and_processed_lifecycle(pg_pool) -> None:
@@ -583,6 +670,51 @@ async def test_mark_event_processed_is_guarded_by_status_and_lease(pg_pool) -> N
         matrix_room_id="!room:test", matrix_event_id="$evt-guard-foreign"
     )
     assert marker is not None and marker.status == "processed"
+
+
+async def test_owned_event_can_record_outcome_but_cannot_be_released_or_taken_over(pg_pool) -> None:
+    """Entering an external write is an irreversible, owner-fenced transition."""
+    await apply_sql_migrations(pg_pool, MIGRATIONS_DIR)
+    matrix_state = MatrixStateRepository(pg_pool)
+
+    claimed = await matrix_state.claim_event(
+        matrix_room_id="!room:test",
+        matrix_event_id="$owned-write",
+        lease_owner="writer-a",
+    )
+    assert claimed is not None
+    assert await matrix_state.begin_event_write(
+        matrix_room_id="!room:test",
+        matrix_event_id="$owned-write",
+        lease_owner="writer-a",
+    )
+
+    await matrix_state.release_event(
+        matrix_room_id="!room:test",
+        matrix_event_id="$owned-write",
+        lease_owner="writer-a",
+    )
+    assert (
+        await matrix_state.adopt_event(
+            matrix_room_id="!room:test",
+            matrix_event_id="$owned-write",
+            lease_owner="writer-b",
+        )
+        is None
+    )
+
+    outcome = await matrix_state.mark_event_written(
+        matrix_room_id="!room:test",
+        matrix_event_id="$owned-write",
+        discourse_topic_id=20,
+        discourse_post_id=101,
+        lease_owner="writer-a",
+    )
+    assert outcome.recorded is True
+    marker = await matrix_state.get_event(
+        matrix_room_id="!room:test", matrix_event_id="$owned-write"
+    )
+    assert marker is not None and marker.status == "written"
 
     # A tokenless reconcile of a 'written' marker (outcome recorded, lease
     # columns cleared by mark_event_written) can still confirm it.
@@ -740,7 +872,7 @@ async def test_fenced_pair_command_sends_pm_exactly_once_across_crash(pg_pool) -
         chat_accounts=None,
         room_links=None,
         delivery_messages=None,
-        audit_logs=None,
+        audit_logs=FakeAuditLogs(),
         event_state=matrix_state,
         relay_matrix_username="MatrixRelayUser",
         relay_telegram_username="TelegramRelayUser",
@@ -769,7 +901,6 @@ async def test_fenced_pair_command_sends_pm_exactly_once_across_crash(pg_pool) -
     service.handle_message.reset_mock()
     matrix.extract_messages_return = [message]
     matrix.crash_on_notice = False
-    matrix.notices.clear()
     await process_sync_messages(sync_response=sync_response, **call_kwargs)
 
     # The PM was NOT sent again; the stored notice was delivered instead.
@@ -804,7 +935,7 @@ async def test_fenced_pair_command_survives_crash_before_pm(pg_pool) -> None:
         chat_accounts=None,
         room_links=None,
         delivery_messages=None,
-        audit_logs=None,
+        audit_logs=FakeAuditLogs(),
         event_state=matrix_state,
         relay_matrix_username="MatrixRelayUser",
         relay_telegram_username="TelegramRelayUser",
@@ -858,7 +989,7 @@ async def test_non_pm_command_notice_failure_keeps_fence_and_replay_never_reruns
         chat_accounts=None,
         room_links=None,
         delivery_messages=None,
-        audit_logs=None,
+        audit_logs=FakeAuditLogs(),
         event_state=matrix_state,
         relay_matrix_username="MatrixRelayUser",
         relay_telegram_username="TelegramRelayUser",
@@ -895,7 +1026,6 @@ async def test_non_pm_command_notice_failure_keeps_fence_and_replay_never_reruns
     service.handle_message.reset_mock()
     matrix.extract_messages_return = [message]
     matrix.crash_on_notice = False
-    matrix.notices.clear()
     await process_sync_messages(sync_response=sync_response, **call_kwargs)
     assert matrix.notices == [("!room:test", "account unpaired")]
     service.handle_message.assert_not_called()
@@ -913,12 +1043,10 @@ async def test_non_pm_command_notice_failure_keeps_fence_and_replay_never_reruns
 async def test_adopt_event_is_exclusive_and_only_takes_stale_claims(pg_pool) -> None:
     """Concurrent adoptions of the same marker: exactly one winner.
 
-    - a second adopt while the marker is 'claimed' loses (the row is 'owned'
-      by the winner, not reusable 'claimed' input);
+    - a second adopt after the stale marker receives a fresh lease loses;
     - a live claim with an unexpired lease is never taken over;
-    - an owned marker with a fresh lease cannot be re-adopted (the previous
-      owner's lease is still live, not because 'owned' is terminal — an
-      owned marker whose lease lapses stays recoverable by design);
+    - an owned marker cannot be re-adopted because it may already represent
+      an ambiguous external write;
     - 'written' outcome markers are never adopted (the external write already
       happened and must not be repeated).
     """
@@ -956,12 +1084,9 @@ async def test_adopt_event_is_exclusive_and_only_takes_stale_claims(pg_pool) -> 
         lease_owner="replay-b",
     )
     assert won is not None
-    assert won.status == "owned"
+    assert won.status == "claimed"
 
-    # The lease replay-b just took is fresh, so a second racing replay loses:
-    # the rejection is lease freshness, not the 'owned' status — an owned
-    # marker whose lease later lapses stays recoverable by design (that is
-    # the crash-after-adoption recovery the at-least-once contract relies on).
+    # The lease replay-b just took is fresh, so a second racing replay loses.
     lost_two = await matrix_state.adopt_event(
         matrix_room_id="!room:test",
         matrix_event_id="$lease-race",
@@ -1066,24 +1191,15 @@ async def test_two_concurrent_handlers_produce_exactly_one_discourse_write(pg_po
     assert marker.discourse_post_id == first.discourse_post_id
 
 
-async def test_crash_after_discourse_write_before_mark_event_written_is_at_least_once(
+async def test_crash_after_discourse_write_before_mark_event_written_fails_closed(
     pg_pool,
 ) -> None:
     """The reviewer's second crash test: the external API has returned but
     mark_event_written() never ran (process died in between).
 
-    This is the ambiguity no status machine can resolve from the marker row
-    alone: the post EXISTS on Discourse, but nothing durable says so, and
-    Discourse's POST /posts.json offers no idempotency primitive (no
-    client-supplied dedup key) the bridge could have used to predict the
-    post beforehand. The semantics change was therefore proposed on issue
-    #9 and accepted: this crash point is documented at-least-once with a
-    bounded window — every other crash point remains exactly-once.
-
-    The test proves BOTH halves of that contract:
-      1. the replay performs the write again (the duplicate window is real);
-      2. it happens exactly once more — the new outcome is durable, so no
-         further replay ever writes again.
+    This is ambiguous because Discourse has no idempotency key. The durable
+    ``owned`` marker therefore fails closed: a replay must never repeat the
+    write and an operator must reconcile whether the remote post exists.
     """
     await apply_sql_migrations(pg_pool, MIGRATIONS_DIR)
     delivery_messages = FakeDeliveryMessages()
@@ -1124,24 +1240,23 @@ async def test_crash_after_discourse_write_before_mark_event_written_is_at_least
     assert row is not None
 
     # Restart: a fresh handler replays the same event against the same DB.
-    # The takeover succeeds (the lease lapsed), nothing durable proves the
-    # first write happened, so the documented at-least-once window applies:
-    # the replay performs the write AGAIN. This assertion is the honest
-    # statement of the residual duplicate window accepted on issue #9.
+    # The owned marker is terminal for automatic takeover even after its
+    # lease expires, because the remote write may already exist.
     recovered = FakeDiscourseClient()
     result = await handle_matrix_reply(discourse_client=recovered, **call_kwargs)
-    assert result.posted is True
-    assert len(recovered.calls) == 1
+    assert result.posted is False
+    assert result.error_message == "event_write_ambiguous"
+    assert len(recovered.calls) == 0
 
-    # The new outcome is now durable ('written' → 'processed'), so the
-    # window is bounded: no further replay ever writes again.
+    # Further replays remain fenced until explicit operator reconciliation.
     again = await handle_matrix_reply(discourse_client=recovered, **call_kwargs)
     assert again.posted is False
-    assert len(recovered.calls) == 1
+    assert again.error_message == "event_write_ambiguous"
+    assert len(recovered.calls) == 0
     marker = await matrix_state.get_event(
         matrix_room_id="!room:test", matrix_event_id=message.event_id
     )
-    assert marker is not None and marker.status == "processed"
+    assert marker is not None and marker.status == "owned"
 
 
 async def test_superseded_attempt_cannot_stamp_or_release_fence(pg_pool) -> None:
@@ -1274,7 +1389,7 @@ async def test_fenced_pair_command_exactly_one_pm_when_two_handlers_race(pg_pool
             chat_accounts=None,
             room_links=None,
             delivery_messages=None,
-            audit_logs=None,
+            audit_logs=FakeAuditLogs(),
             event_state=matrix_state,
             relay_matrix_username="MatrixRelayUser",
             relay_telegram_username="TelegramRelayUser",
@@ -1294,7 +1409,7 @@ async def test_fenced_pair_command_exactly_one_pm_when_two_handlers_race(pg_pool
             chat_accounts=None,
             room_links=None,
             delivery_messages=None,
-            audit_logs=None,
+            audit_logs=FakeAuditLogs(),
             event_state=matrix_state,
             relay_matrix_username="MatrixRelayUser",
             relay_telegram_username="TelegramRelayUser",
@@ -1331,7 +1446,7 @@ async def test_fenced_pair_command_exactly_one_pm_when_two_handlers_race(pg_pool
         chat_accounts=None,
         room_links=None,
         delivery_messages=None,
-        audit_logs=None,
+        audit_logs=FakeAuditLogs(),
         event_state=matrix_state,
         relay_matrix_username="MatrixRelayUser",
         relay_telegram_username="TelegramRelayUser",

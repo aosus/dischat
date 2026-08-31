@@ -10,7 +10,8 @@ For single-host deployments use the bundled Docker Compose stack: PostgreSQL dat
 
 Before going to production:
 
-1. set a strong `POSTGRES_PASSWORD` in `.env` (git-ignored; the example `dischat/dischat` credentials are development-only);
+1. set different strong `POSTGRES_ADMIN_PASSWORD` and `POSTGRES_PASSWORD`
+   values in `.env` (git-ignored);
 2. take regular backups with `docker compose exec -T postgres pg_dump -U dischat -d dischat > backup.sql`.
 
 See [Docker deployment](docs/docker.md) for the full production path (bundled vs external database) and [backup/restore commands](docs/docker.md#data-persistence-backups).

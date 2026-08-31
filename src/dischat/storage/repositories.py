@@ -1136,6 +1136,23 @@ class DeliveryJobRepository:
         assert row is not None
         return _record_to_delivery_job(row)
 
+    async def list_room_ids_for_discourse_post(self, *, discourse_post_id: int) -> list[str]:
+        """Return rooms targeted by the parent post's existing delivery jobs."""
+        async with self._pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT DISTINCT dj.matrix_room_id
+                FROM delivery_jobs dj
+                JOIN discourse_events de ON de.id = dj.event_id
+                WHERE de.discourse_post_id = $1
+                  AND dj.target_type = 'room'
+                  AND dj.matrix_room_id IS NOT NULL
+                ORDER BY dj.matrix_room_id
+                """,
+                discourse_post_id,
+            )
+        return [str(row["matrix_room_id"]) for row in rows]
+
     async def claim_next_job(
         self, *, lease_seconds: int = DEFAULT_JOB_LEASE_SECONDS
     ) -> DeliveryJobRecord | None:
@@ -1552,6 +1569,33 @@ class MatrixStateRepository:
                 next_batch,
             )
 
+    async def get_discourse_last_seen_post_id(self) -> int | None:
+        """Return the durable high-water mark for the Discourse post feed."""
+        async with self._pool.acquire() as connection:
+            row = await connection.fetchrow(
+                "SELECT last_seen_post_id FROM discourse_poll_state WHERE singleton = TRUE"
+            )
+        if row is None or row["last_seen_post_id"] is None:
+            return None
+        return int(row["last_seen_post_id"])
+
+    async def set_discourse_last_seen_post_id(self, post_id: int) -> None:
+        """Advance the durable Discourse cursor without ever moving it backwards."""
+        async with self._pool.acquire() as connection:
+            await connection.execute(
+                """
+                INSERT INTO discourse_poll_state (singleton, last_seen_post_id, updated_at)
+                VALUES (TRUE, $1, NOW())
+                ON CONFLICT (singleton) DO UPDATE SET
+                    last_seen_post_id = GREATEST(
+                        COALESCE(discourse_poll_state.last_seen_post_id, 0),
+                        EXCLUDED.last_seen_post_id
+                    ),
+                    updated_at = NOW()
+                """,
+                post_id,
+            )
+
     async def claim_event(
         self,
         *,
@@ -1613,19 +1657,18 @@ class MatrixStateRepository:
     ) -> MatrixEventStateRecord | None:
         """Atomically take exclusive ownership of an orphaned marker.
 
-        Exactly one concurrent caller can win this transition: the row moves
-        from ``claimed``/``owned`` to the ``owned`` state under the caller's
-        ``lease_owner`` token, so a loser gets ``None`` back and must not
-        perform the external write. Takeover only succeeds when the fence is
+        Exactly one concurrent caller can win this transition: the stale
+        ``claimed`` row receives the caller's fresh ``lease_owner`` token, so
+        a loser gets ``None`` back and must not perform the external write.
+        It remains ``claimed`` until ``begin_event_write`` enters the
+        non-replayable ``owned`` state. Takeover only succeeds when the fence is
         demonstrably stale — either the previous owner never held a lease (a
         pre-lease marker) or its lease has already lapsed — so a live worker
-        is never dispossessed. A fence that lapsed *before* adoption (status
-        ``claimed``) and one that lapsed *after* adoption but before any
-        external write (status ``owned``, e.g. the process died between the
-        write call returning and ``mark_event_written``) are both recoverable;
-        ``written``/``processed`` markers are not.
+        is never dispossessed. Only ``claimed`` is recoverable; ``owned`` may
+        already represent an unrecorded external write and is deliberately
+        terminal for automatic takeover, as are ``written``/``processed``.
 
-        Returns the owned record when this caller now holds the fence;
+        Returns the freshly leased claimed record when this caller now holds the fence;
         ``None`` otherwise (another attempt owns it, or an outcome was
         already recorded as ``written``/``processed``).
         """
@@ -1635,8 +1678,7 @@ class MatrixStateRepository:
             row = await connection.fetchrow(
                 """
                 UPDATE matrix_event_state
-                SET status = 'owned',
-                    lease_owner = $3,
+                SET lease_owner = $3,
                     lease_expires_at = NOW() + make_interval(secs => $4::double precision),
                     updated_at = NOW()
                 WHERE room_id = $1 AND event_id = $2
@@ -1672,7 +1714,7 @@ class MatrixStateRepository:
                     lease_expires_at = NOW() + make_interval(secs => $4::double precision),
                     updated_at = NOW()
                 WHERE room_id = $1 AND event_id = $2
-                  AND status IN ('claimed', 'owned')
+                  AND status = 'claimed'
                   AND lease_owner = $3
                 RETURNING id
                 """,
@@ -1702,9 +1744,9 @@ class MatrixStateRepository:
         the recorded outcome instead of writing a duplicate.
 
         Only the attempt that holds the fence may stamp its outcome here:
-        with ``lease_owner`` set, the marker must still be in the state this
-        attempt left it in (``claimed`` for a fresh claim, ``owned`` after an
-        adoption) and carry this attempt's lease token. A superseded attempt
+        with ``lease_owner`` set, the marker must still be in ``claimed``
+        (local-only command side effects) or ``owned`` (an external write was
+        entered) and carry this attempt's lease token. A superseded attempt
         — one that raced a takeover and lost — therefore cannot overwrite the
         winner's record; it learns the winning outcome and must surface that
         instead of its own.
@@ -1721,7 +1763,7 @@ class MatrixStateRepository:
                     response_notice = COALESCE($5, response_notice),
                     updated_at = NOW()
                 WHERE room_id = $1 AND event_id = $2
-                  AND status = 'claimed'
+                  AND status IN ('claimed', 'owned')
                   AND ($6::text IS NULL OR lease_owner = $6::text)
                 RETURNING discourse_topic_id, discourse_post_id
                 """,
@@ -1759,9 +1801,10 @@ class MatrixStateRepository:
     ) -> None:
         """Confirm the marker once all side effects are durably recorded.
 
-        Like every other ledger primitive, the transition is guarded: with a
-        lease token the marker must still belong to this attempt, and it must
-        be in a pre-confirmation state (``claimed``/``owned``/``written``).
+        Like every other ledger primitive, the transition is guarded. A
+        tokenless reconciliation can confirm ``claimed``/``written`` legacy
+        states, while ``owned`` can only be confirmed by the exact lease owner
+        that entered the non-replayable side-effect region.
         A caller that lost the fence — or one racing a just-confirmed
         replay — updates nothing instead of confirming over the winner.
         """
@@ -1771,12 +1814,35 @@ class MatrixStateRepository:
                 UPDATE matrix_event_state
                 SET status = 'processed', updated_at = NOW()
                 WHERE room_id = $1 AND event_id = $2
-                  AND status IN ('claimed', 'owned', 'written')
-                  AND ($3::text IS NULL OR lease_owner = $3::text)
+                  AND (
+                      (status IN ('claimed', 'written')
+                       AND ($3::text IS NULL OR lease_owner = $3::text))
+                      OR
+                      (status = 'owned' AND $3::text IS NOT NULL
+                       AND lease_owner = $3::text)
+                  )
                 """,
                 matrix_room_id,
                 matrix_event_id,
                 lease_owner,
+            )
+
+    async def reconcile_event_from_mapping(
+        self, *, matrix_room_id: str, matrix_event_id: str
+    ) -> None:
+        """Confirm any remaining marker when a delivery mapping proves the write."""
+        async with self._pool.acquire() as connection:
+            await connection.execute(
+                """
+                UPDATE matrix_event_state
+                SET status = 'processed',
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = NOW()
+                WHERE room_id = $1 AND event_id = $2
+                """,
+                matrix_room_id,
+                matrix_event_id,
             )
 
     async def prune_processed_events(self, *, older_than_days: int = 7) -> int:
@@ -1820,9 +1886,10 @@ class MatrixStateRepository:
     ) -> None:
         """Give up an unprocessed claim so a later delivery can retry cleanly.
 
-        Only a marker that provably made no external write can be released:
-        once the outcome is recorded (``written``) or confirmed
-        (``processed``), the fence must survive so a replay never re-writes.
+        Only a ``claimed`` marker, which has not entered an external write,
+        can be released. Once the marker becomes ``owned`` the remote outcome
+        may be ambiguous, so the fence must survive until an operator
+        reconciles it; ``written`` and ``processed`` are also permanent.
         With ``lease_owner`` set, the marker must still carry this attempt's
         token — a superseded attempt must never tear down the fence of the
         attempt that took the lease over.
@@ -1832,7 +1899,7 @@ class MatrixStateRepository:
                 """
                 DELETE FROM matrix_event_state
                 WHERE room_id = $1 AND event_id = $2
-                  AND status IN ('claimed', 'owned')
+                  AND status = 'claimed'
                   AND ($3::text IS NULL OR lease_owner = $3::text)
                 """,
                 matrix_room_id,

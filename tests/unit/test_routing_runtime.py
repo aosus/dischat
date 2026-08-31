@@ -4,7 +4,7 @@ from typing import Any
 from dischat.bridge import handle_matrix_reply
 from dischat.discourse.models import DiscourseEvent
 from dischat.discourse.router import route_event
-from dischat.discourse.sync import PollerState, poll_once
+from dischat.discourse.sync import PollerState, _list_unseen_latest_posts, poll_once
 from dischat.jobs.workers import deliver_job
 from dischat.matrix.client import MatrixMessage, MatrixSendResult
 from dischat.security.audit import STATUS_FAILED, STATUS_SUCCESS, AuditEntry
@@ -57,13 +57,39 @@ class FakeDiscourseClient:
         return FakeDiscourseWriteResult(post_id=99, topic_id=topic_id, raw=raw)
 
     async def list_latest_posts(self, *, before: int | None = None) -> list[dict[str, object]]:
-        return self.latest_posts
+        if before is None:
+            return self.latest_posts
+        return [post for post in self.latest_posts if int(str(post["id"])) < before]
 
     async def get_topic(self, topic_id: int) -> dict[str, object]:
         return self.topics[topic_id]
 
     async def get_post(self, post_id: int) -> dict[str, object]:
         return self.posts[post_id]
+
+
+async def test_latest_posts_backfill_pages_until_durable_cursor() -> None:
+    class PagedClient:
+        def __init__(self) -> None:
+            self.calls: list[int | None] = []
+
+        async def list_latest_posts(self, *, before: int | None = None) -> list[dict[str, object]]:
+            self.calls.append(before)
+            pages: dict[int | None, list[dict[str, object]]] = {
+                None: [{"id": 36}, {"id": 35}],
+                35: [{"id": 34}, {"id": 33}],
+                33: [{"id": 32}, {"id": 31}],
+            }
+            return pages.get(before, [])
+
+        async def get_topic(self, topic_id: int) -> dict[str, object]:
+            raise AssertionError("not used")
+
+    client = PagedClient()
+    posts = await _list_unseen_latest_posts(client, last_seen_post_id=31)
+
+    assert client.calls == [None, 35, 33]
+    assert sorted(int(str(post["id"])) for post in posts) == [31, 32, 33, 34, 35, 36]
 
 
 class FakeMatrixClient:
@@ -89,7 +115,9 @@ class FakeMatrixClient:
         self.texts.append((room_id, body, formatted))
         return MatrixSendResult(event_id="$text", room_id=room_id)
 
-    async def send_notice(self, room_id: str, body: str) -> MatrixSendResult:
+    async def send_notice(
+        self, room_id: str, body: str, *, tx_id: str | None = None
+    ) -> MatrixSendResult:
         self.notices.append((room_id, body))
         return MatrixSendResult(event_id="$notice", room_id=room_id)
 
@@ -293,6 +321,7 @@ class FakeUserWatches:
 class FakeDeliveryJobs:
     def __init__(self) -> None:
         self.enqueued: list[dict[str, object]] = []
+        self.parent_rooms_by_post: dict[int, list[str]] = {}
 
     async def enqueue(
         self,
@@ -310,6 +339,9 @@ class FakeDeliveryJobs:
                 "matrix_room_id": matrix_room_id,
             }
         )
+
+    async def list_room_ids_for_discourse_post(self, *, discourse_post_id: int) -> list[str]:
+        return self.parent_rooms_by_post.get(discourse_post_id, [])
 
 
 class FakeCategories:
@@ -1153,6 +1185,41 @@ async def test_route_event_defaults_never_reactivate_non_public_matching() -> No
     )
 
     assert jobs.enqueued == []
+
+
+async def test_same_poll_reply_inherits_parent_pending_room_job() -> None:
+    jobs = FakeDeliveryJobs()
+    jobs.parent_rooms_by_post[100] = ["!room:test"]
+
+    await route_event(
+        event_id=2,
+        discourse_event=DiscourseEvent(
+            discourse_topic_id=20,
+            discourse_post_id=101,
+            reply_to_post_number=2,
+            event_type="bridged_thread_reply",
+            category_id=99,
+            author_username="bob",
+            target_discourse_username=None,
+            raw_payload_json={"reply_to_discourse_post_id": 100},
+        ),
+        category_slug="support",
+        category_id=1,
+        room_links=FakeRoomLinks(),
+        chat_accounts=FakeChatAccounts(),
+        user_watches=FakeUserWatches(),
+        delivery_messages=FakeDeliveryMessages(),
+        delivery_jobs=jobs,
+    )
+
+    assert jobs.enqueued == [
+        {
+            "event_id": 2,
+            "target_type": "room",
+            "target_mxid": None,
+            "matrix_room_id": "!room:test",
+        }
+    ]
 
 
 async def test_non_public_category_gets_no_exception_outside_live_e2e_mode() -> None:

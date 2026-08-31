@@ -44,7 +44,9 @@ class FakeDiscourseClient:
         return self.categories
 
     async def list_latest_posts(self, *, before: int | None = None) -> list[dict[str, object]]:
-        return self.latest_posts
+        if before is None:
+            return self.latest_posts
+        return [post for post in self.latest_posts if int(str(post["id"])) < before]
 
     async def list_category_latest_posts(
         self, *, category_slug: str, category_id: int
@@ -155,6 +157,9 @@ class FakeDeliveryJobs:
                 last_error=None,
             )
         )
+
+    async def list_room_ids_for_discourse_post(self, *, discourse_post_id: int) -> list[str]:
+        return []
 
 
 class FakeDeliveryMessages:
@@ -354,6 +359,74 @@ async def test_run_iteration_uses_long_poll_after_initial_sync(monkeypatch) -> N
     )
 
     assert context.matrix_client.sync_calls == [{"since": "batch-1", "timeout_ms": 15000}]
+
+
+async def test_deferred_matrix_batch_does_not_prune_replay_fences(monkeypatch) -> None:
+    async def fake_process_sync_messages(**kwargs) -> bool:
+        return False
+
+    async def fake_poll_once(**kwargs) -> int:
+        return 0
+
+    async def fake_drain_delivery_jobs(context) -> int:
+        return 0
+
+    async def fake_refresh_category_visibility(**kwargs) -> bool:
+        return True
+
+    class State:
+        def __init__(self) -> None:
+            self.checkpoints: list[str] = []
+            self.prunes: list[int] = []
+
+        async def set_sync_next_batch(self, next_batch: str) -> None:
+            self.checkpoints.append(next_batch)
+
+        async def prune_processed_events(self, *, older_than_days: int) -> int:
+            self.prunes.append(older_than_days)
+            return 0
+
+    monkeypatch.setattr("dischat.main.process_sync_messages", fake_process_sync_messages)
+    monkeypatch.setattr("dischat.main.poll_once", fake_poll_once)
+    monkeypatch.setattr("dischat.main.drain_delivery_jobs", fake_drain_delivery_jobs)
+    monkeypatch.setattr(
+        "dischat.main.refresh_category_visibility", fake_refresh_category_visibility
+    )
+
+    state = State()
+    context = SimpleNamespace(
+        matrix_client=FakeMatrixClient(),
+        service=object(),
+        discourse_client=object(),
+        chat_accounts=object(),
+        room_links=object(),
+        delivery_messages=object(),
+        audit_logs=object(),
+        categories=object(),
+        discourse_events=object(),
+        user_watches=object(),
+        delivery_jobs=object(),
+        matrix_state=state,
+    )
+    settings = SimpleNamespace(
+        poll_interval_seconds=15,
+        discourse_relay_matrix_username="",
+        discourse_relay_telegram_username="",
+        discourse_relay_discord_username="",
+        discourse_test_category_id=None,
+        matrix_event_retention_days=7,
+    )
+
+    next_batch = await run_iteration(
+        context=context,
+        settings=settings,
+        poll_state=PollerState(),
+        sync_since="batch-1",
+    )
+
+    assert next_batch == "batch-1"
+    assert state.checkpoints == []
+    assert state.prunes == []
 
 
 def _refresh_settings() -> SimpleNamespace:
@@ -824,9 +897,9 @@ async def test_public_to_private_with_refresh_failure_delivers_nothing(monkeypat
     assert len(context.discourse_events.created) == events_before
     assert len(delivery_jobs.enqueued) == jobs_before
     assert len(delivery_jobs.completed) == 1
-    # Skipped posts intentionally do not advance last_seen_post_id (they may be
-    # re-evaluated against a later, hopefully-public, snapshot).
-    assert poll_state.last_seen_post_id == 31
+    # The fresh visibility snapshot proves post 32 is private. The cursor
+    # advances so it can never leak retroactively if the category reopens.
+    assert poll_state.last_seen_post_id == 32
 
     # --- A new public post after recovery is delivered again. --------------------------
     discourse.categories = [
@@ -844,11 +917,11 @@ async def test_public_to_private_with_refresh_failure_delivers_nothing(monkeypat
         sync_since="batch-2",
     )
     assert poll_state.visibility_stale is False
-    # With the category public again, the previously withheld post 32 is re-evaluated
-    # (skipped posts never advanced last_seen_post_id) and both 32 and 33 bridge now.
-    assert len(context.discourse_events.created) == events_before + 2
-    assert len(delivery_jobs.enqueued) == jobs_before + 2
-    assert len(delivery_jobs.completed) == 3
+    # Previously private post 32 remains behind the cursor; only the new public
+    # post is bridged.
+    assert len(context.discourse_events.created) == events_before + 1
+    assert len(delivery_jobs.enqueued) == jobs_before + 1
+    assert len(delivery_jobs.completed) == 2
     assert poll_state.last_seen_post_id == 33
 
 
@@ -956,7 +1029,7 @@ async def test_public_to_private_between_successful_refreshes_delivers_nothing(m
     assert len(delivery_jobs.enqueued) == jobs_before
     assert len(delivery_jobs.completed) == 1
     assert delivery_jobs.failed == []
-    assert poll_state.last_seen_post_id == 31
+    assert poll_state.last_seen_post_id == 32
 
     # --- Iteration 3: the post stays withheld on every subsequent poll; a NEW PUBLIC
     # post 33 in another category bridges normally. ------------------------------------

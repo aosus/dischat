@@ -5,7 +5,7 @@ from typing import Any, Protocol
 
 from dischat.bridge import handle_matrix_reply
 from dischat.commands.parser import parse_command
-from dischat.matrix.client import MatrixMessage, MatrixSendResult
+from dischat.matrix.client import MatrixMessage, MatrixSendResult, event_notice_tx_id
 from dischat.security.audit import (
     ACTION_PAIRING_PM,
     ACTION_SEND_MATRIX_NOTICE,
@@ -49,7 +49,8 @@ async def _deliver_fenced_command(
       - stale ``claimed`` marker (predecessor crashed before the command's
         side effects, lease lapsed) → atomic lease takeover, then run the
         command fresh, delivering a valid code;
-      - ``owned`` marker → a live attempt holds the fence; do nothing;
+      - ``owned`` marker → a command mutation or external write may already
+        have happened; fail closed for operator reconciliation;
       - ``written`` marker → the command already ran and its side effects
         (e.g. the pairing PM) exist; finish only the pending room notice
         stored on the marker, never re-running the command;
@@ -81,11 +82,9 @@ async def _deliver_fenced_command(
     if claimed is None:
         marker = await event_state.get_event(matrix_room_id=room_id, matrix_event_id=event_id)
         if marker is not None and marker.status == "claimed":
-            # Exclusive takeover of a demonstrably stale fence: the row moves
-            # to 'owned' under this attempt's token, so exactly one racing
-            # replay can win. The repository only releases a fence whose
-            # lease has lapsed (a crashed predecessor), never one a live
-            # worker still holds.
+            # Exclusive takeover of a demonstrably stale claimed fence: the
+            # row receives this attempt's fresh lease token, so exactly one
+            # racing replay can win. Owned markers are never adopted.
             adopted = await event_state.adopt_event(
                 matrix_room_id=room_id,
                 matrix_event_id=event_id,
@@ -113,6 +112,7 @@ async def _deliver_fenced_command(
                     body=marker.response_notice,
                     room_id=room_id,
                     pairing_target_username=None,
+                    tx_id=event_notice_tx_id(room_id, event_id),
                 )
             await event_state.mark_event_processed(
                 matrix_room_id=room_id, matrix_event_id=event_id, lease_owner=None
@@ -149,6 +149,7 @@ async def _deliver_fenced_command(
                 matrix_room_id=room_id, matrix_event_id=event_id, lease_owner=lease_owner
             )
             return True
+
         # Pairing-specific delivery first: the code goes to the user's
         # Discourse DM, not the room notice. The PM is the command's external
         # write and completes before the outcome is recorded, so a 'written'
@@ -162,6 +163,7 @@ async def _deliver_fenced_command(
             sender_platform=sender_platform,
             pairing_code=command_response.pairing_code_to_deliver,
             pairing_target_username=command_response.pairing_target_username,
+            preserve_pending_on_error=True,
         )
         # Record the outcome for EVERY command (not just PM deliveries)
         # BEFORE the room notice: the fenced guarantee is that a replay
@@ -189,19 +191,12 @@ async def _deliver_fenced_command(
             body=command_response.body,
             room_id=room_id,
             pairing_target_username=command_response.pairing_target_username,
+            tx_id=event_notice_tx_id(room_id, event_id),
         )
     except Exception:
-        # Failed before run_command() returned (no external write happened
-        # in this attempt) or while sending the notice with the outcome
-        # already recorded — in the notice case the fence is 'written' and
-        # release_event cannot delete it, and in the command case the release
-        # only lands while this attempt still holds the lease, so either way
-        # a replay can never re-run the command's side effects.
-        await event_state.release_event(
-            matrix_room_id=room_id,
-            matrix_event_id=event_id,
-            lease_owner=lease_owner,
-        )
+        # ``begin_event_write`` moved the marker to ``owned`` before any
+        # command mutation. The outcome may be ambiguous, so automatic replay
+        # is forbidden and the marker remains for operator reconciliation.
         raise
     # The outcome was recorded (and the lease columns cleared) before the
     # notice, so this confirm is a guarded tokenless transition from
@@ -227,7 +222,9 @@ class MatrixSyncClient(Protocol):
 
     def extract_messages(self, sync_response: object) -> list[MatrixMessage]: ...
 
-    async def send_notice(self, room_id: str, body: str) -> MatrixSendResult: ...
+    async def send_notice(
+        self, room_id: str, body: str, *, tx_id: str | None = None
+    ) -> MatrixSendResult: ...
 
 
 class CommandService(Protocol):
@@ -340,9 +337,10 @@ async def _deliver_pairing_pm(
     sender_platform: str,
     pairing_code: str | None,
     pairing_target_username: str | None,
-) -> None:
+    preserve_pending_on_error: bool = False,
+) -> bool:
     if not pairing_code or not pairing_target_username:
-        return
+        return True
     attempt_id = await record_audit_attempt(
         audit_logs,
         AuditEntry(
@@ -362,11 +360,17 @@ async def _deliver_pairing_pm(
             raw=pairing_code,
         )
     except Exception as exc:
-        await update_audit_outcome(
-            audit_logs, attempt_id, success=False, error_message=failure_reason(exc)
-        )
+        # With a durable fence the transport outcome is ambiguous: Discourse
+        # may have committed the PM before the exception reached us. Leave the
+        # attempt pending for reconciliation. Legacy unfenced callers retain
+        # the old explicit-failure audit outcome.
+        if not preserve_pending_on_error:
+            await update_audit_outcome(
+                audit_logs, attempt_id, success=False, error_message=failure_reason(exc)
+            )
         raise
     await update_audit_outcome(audit_logs, attempt_id, success=True, error_message=None)
+    return True
 
 
 async def _deliver_matrix_notice(
@@ -378,6 +382,7 @@ async def _deliver_matrix_notice(
     body: str,
     pairing_target_username: str | None,
     room_id: str,
+    tx_id: str | None = None,
 ) -> None:
     attempt_id = await record_audit_attempt(
         audit_logs,
@@ -393,7 +398,7 @@ async def _deliver_matrix_notice(
         require_logger=True,
     )
     try:
-        notice_result = await matrix_client.send_notice(room_id, body)
+        notice_result = await matrix_client.send_notice(room_id, body, tx_id=tx_id)
     except Exception as exc:
         await update_audit_outcome(
             audit_logs, attempt_id, success=False, error_message=failure_reason(exc)

@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     discourse_relay_discord_username: str = Field(
         default="", alias="DISCOURSE_RELAY_DISCORD_USERNAME"
     )
-    poll_interval_seconds: int = Field(default=60, alias="POLL_INTERVAL_SECONDS")
+    poll_interval_seconds: int = Field(default=60, gt=0, alias="POLL_INTERVAL_SECONDS")
     delivery_job_lease_seconds: int = Field(default=120, gt=0, alias="DELIVERY_JOB_LEASE_SECONDS")
     config_file: Path = Field(default=Path("config.yaml"), alias="CONFIG_FILE")
     default_locale: Locale = Field(default="ar", alias="DEFAULT_LOCALE")
@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     # Retention window (days) for confirmed (status='processed') rows in the
     # matrix_event_state ledger. Only the /sync replay horizon strictly needs
     # them; seven days is comfortably beyond any realistic horizon.
-    matrix_event_retention_days: int = Field(default=7, alias="MATRIX_EVENT_RETENTION_DAYS")
+    matrix_event_retention_days: int = Field(default=7, gt=0, alias="MATRIX_EVENT_RETENTION_DAYS")
 
     def load_file_config(self) -> FileConfig:
         if not self.config_file.exists():

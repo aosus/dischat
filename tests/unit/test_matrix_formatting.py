@@ -1,7 +1,15 @@
 from typing import cast
 
+from dischat.matrix.client import event_notice_tx_id
 from dischat.matrix.formatting import plain_notice, plain_text, reply_message, rich_text
 from dischat.matrix.replies import get_reply_parent_event_id
+
+
+def test_event_notice_transaction_id_is_stable_and_event_scoped() -> None:
+    first = event_notice_tx_id("!room:test", "$event-1")
+    assert first == event_notice_tx_id("!room:test", "$event-1")
+    assert first != event_notice_tx_id("!room:test", "$event-2")
+    assert first != event_notice_tx_id("!other:test", "$event-1")
 
 
 def test_plain_text_uses_text_type() -> None:

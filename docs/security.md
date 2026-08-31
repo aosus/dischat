@@ -90,14 +90,21 @@ revalidation must never leave the last-known snapshot in charge:
   snapshot and clears the flag.
 - The stale-snapshot gate also lives inside `poll_once` itself (defense in depth), so
   any direct caller passing a stale state gets the same fail-closed behavior.
-- Posts skipped while a category was private are re-evaluated if it later becomes
-  public again (they never advanced `last_seen_post_id`); Matrix sync/commands and
-  delivery of already-enqueued jobs are unaffected by the suspension. The live-E2E test
-  category is exempt, since it never consults the visibility snapshot.
+- Once a fresh snapshot proves a post belongs to a private/disabled category,
+  the durable scan cursor advances past it. Content observed as private is
+  never retroactively delivered merely because the category later becomes
+  public. Matrix sync/commands and delivery of already-enqueued jobs are
+  unaffected by a visibility-refresh suspension. The live-E2E test category
+  is exempt, since it never consults the visibility snapshot.
 
 Deployment secrets hygiene:
 
-- the example `dischat/dischat` database credentials in `docker-compose.yml` are development-only; set a strong `POSTGRES_PASSWORD` in `.env` (git-ignored) before any real deployment
+- the bundled deployment uses a bootstrap `dischat_admin` role and a separate
+  non-superuser `dischat` runtime/migration role; set different strong
+  `POSTGRES_ADMIN_PASSWORD` and `POSTGRES_PASSWORD` values in `.env`
+- `.dockerignore` excludes `.env*` and runtime `config*.yaml` files; Compose
+  mounts `config.yaml` read-only so credentials and room mappings do not enter
+  container image layers
 - the bundled PostgreSQL data volume (`postgres-data`) is the authoritative store for pairings, watches, room links, queued deliveries, and audit records — include it in your backup plan (see [Docker: Data persistence & backups](docker.md#data-persistence-backups))
 
 ## Audit coverage for live write paths

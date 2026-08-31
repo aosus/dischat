@@ -5,6 +5,7 @@ import logging
 
 from dischat.config import load_settings
 from dischat.discourse.sync import PollerState, poll_once
+from dischat.healthcheck import write_heartbeat
 from dischat.jobs.workers import deliver_job
 from dischat.logging import configure_logging
 from dischat.matrix.handler import process_sync_messages
@@ -207,6 +208,12 @@ async def run_iteration(
         live_e2e_category_id=settings.discourse_test_category_id,
         visibility_stale=poll_state.visibility_stale,
     )
+    if context_has_matrix_state(context) and poll_state.last_seen_post_id is not None:
+        set_discourse_cursor = getattr(
+            context.matrix_state, "set_discourse_last_seen_post_id", None
+        )
+        if set_discourse_cursor is not None:
+            await set_discourse_cursor(poll_state.last_seen_post_id)
     if processed:
         logger.info("Processed %s Discourse events", processed)
 
@@ -214,10 +221,12 @@ async def run_iteration(
     if delivered:
         logger.info("Delivered %s Matrix jobs", delivered)
     next_batch = getattr(sync_response, "next_batch", None)
+    matrix_checkpointed = False
     if matrix_batch_terminal and isinstance(next_batch, str) and context_has_matrix_state(context):
         # Commit the continuation token before retention. If this write fails,
         # no replay fence is pruned from under the still-old durable token.
         await context.matrix_state.set_sync_next_batch(next_batch)
+        matrix_checkpointed = True
 
     # Ledger retention: confirmed ('processed') markers past the window are
     # dead weight — the fence only needs them to outlive the /sync replay
@@ -225,7 +234,7 @@ async def run_iteration(
     # traffic; claimed/owned/written rows are never touched (removing one
     # could re-open an external write). Failures here must not fail the
     # iteration: retention is housekeeping, not a correctness step.
-    if context_has_matrix_state(context):
+    if matrix_checkpointed:
         try:
             await context.matrix_state.prune_processed_events(
                 older_than_days=settings.matrix_event_retention_days
@@ -249,6 +258,7 @@ async def run() -> None:
     context = await build_context(settings)
     try:
         await context.matrix_client.login()
+        write_heartbeat()
 
         discourse_categories = await context.discourse_client.list_categories()
         category_lookup = await sync_categories_from_discourse(
@@ -262,7 +272,9 @@ async def run() -> None:
             category_lookup=category_lookup,
         )
 
-        poll_state = PollerState()
+        poll_state = PollerState(
+            last_seen_post_id=await context.matrix_state.get_discourse_last_seen_post_id()
+        )
         sync_since: str | None = await context.matrix_state.get_sync_next_batch()
         if sync_since is not None:
             logger.info("Resuming Matrix sync from persisted token %s", sync_since)
@@ -273,6 +285,7 @@ async def run() -> None:
                 poll_state=poll_state,
                 sync_since=sync_since,
             )
+            write_heartbeat()
     finally:
         await context.close()
 

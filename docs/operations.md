@@ -10,6 +10,12 @@ Recommended operational tasks:
 - keep the bot invited to target rooms and DM rooms
 - back up the database regularly (see [Docker: Data persistence & backups](docker.md#data-persistence-backups))
 
+The Discourse feed high-water mark is persisted in
+`discourse_poll_state`. After a restart, the poller pages backwards through
+`/posts.json` until it reaches that cursor, so downtime longer than one feed
+page does not skip posts. A brand-new deployment intentionally begins with the
+current latest page instead of replaying the forum's entire history.
+
 ## Delivery job lifecycle
 
 Delivery jobs move through the following states:

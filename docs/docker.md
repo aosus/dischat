@@ -20,38 +20,57 @@ Choose an **external PostgreSQL instance** when you already operate one, need ma
 2. Start the bridge without its Compose dependencies:
 
    ```bash
-   POSTGRES_PASSWORD=external-database-unused \
+   POSTGRES_ADMIN_PASSWORD=external-admin-unused \
+   POSTGRES_PASSWORD=external-runtime-unused \
      docker compose up -d --no-deps dischat
    ```
 
    `dischat` declares `depends_on` for the bundled `postgres` service, so without
    `--no-deps`, Compose would start the bundled database too. Compose interpolates
    the full file before selecting services, so its required bundled-database
-   password must still receive a nonempty, unused placeholder as shown above.
+   passwords must still receive nonempty, unused placeholders as shown above.
 
-## Development vs production database credentials
+## Database roles and credentials
 
-The example user/password pair `dischat/dischat` in `docker-compose.yml` is **for local development only**.
+The bundled database creates two roles on the first initialization:
 
-For production, set a strong password before the first startup (the password is baked into the data directory on initial volume creation):
+- `dischat_admin`, the PostgreSQL image's bootstrap administrator;
+- `dischat`, a separate `NOSUPERUSER`, `NOCREATEDB`, `NOCREATEROLE` runtime
+  role that owns only the `dischat` database/schema and runs application
+  migrations.
+
+Set different strong passwords for both roles before first startup (they are
+written into the data directory when the volume is initialized):
 
 ```bash
 # .env next to docker-compose.yml
-POSTGRES_PASSWORD=<long-random-password>
+POSTGRES_ADMIN_PASSWORD=<long-random-admin-password>
+POSTGRES_PASSWORD=<different-long-random-runtime-password>
 ```
 
 and make sure `DATABASE_URL` inside the app's `.env` file matches it:
 
 ```text
-DATABASE_URL=postgresql://dischat:<same-password>@postgres:5432/dischat
+DATABASE_URL=postgresql://dischat:<runtime-password>@postgres:5432/dischat
 ```
 
 > [!NOTE]
 > `DATABASE_URL` is parsed as a URI by asyncpg. Percent-encode URI-reserved characters (`@ : / # ? & = %`) in both the username and the password — e.g. Python's `urllib.parse.quote(password, safe="")` — or restrict yourself to URL-safe characters (letters, digits, `-`, `_`).
 
-The password necessarily stays in `.env` even in production: the bundled `postgres` service reads it from the `POSTGRES_PASSWORD` environment variable, and the app reads the same secret inside `DATABASE_URL`, which has no file-based form. Compose interpolates each file *before* merging overrides, so the required `POSTGRES_PASSWORD` in `docker-compose.yml` cannot be swapped for the postgres image's `POSTGRES_PASSWORD_FILE` mechanism via an override file — the override fails interpolation with a "required variable POSTGRES_PASSWORD is missing a value" error unless the variable is set in the environment anyway, which defeats the purpose. For stronger secret hygiene, keep the value out of the repository (`.env` is git-ignored) and restrict file permissions on production hosts (`chmod 600 .env`).
+Both passwords stay in `.env` for the bundled deployment. Keep that file out
+of the repository and restrict it with `chmod 600 .env`. `.dockerignore`
+explicitly excludes `.env*` and runtime `config*.yaml` files so credentials
+and room mappings cannot enter image layers; Compose mounts `config.yaml`
+read-only at runtime.
 
-Rotating the password later requires changing it inside PostgreSQL (`ALTER USER ... WITH PASSWORD`) plus updating `POSTGRES_PASSWORD` and `DATABASE_URL` in `.env`, since environment variables only apply on first initialization of the data directory.
+Rotating a password later requires `ALTER ROLE ... WITH PASSWORD` plus the
+matching `.env` update, since initialization variables apply only to a new
+data volume.
+
+The application image includes a heartbeat healthcheck. A stale heartbeat
+marks the container unhealthy after five minutes; monitor that status in
+production. Matrix network timeout retries are bounded, so persistent Matrix
+failures terminate the process and `restart: unless-stopped` can recover it.
 
 ## Data persistence & backups
 

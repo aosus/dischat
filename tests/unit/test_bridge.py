@@ -52,7 +52,9 @@ class FakeMatrixClient:
         self.dms: list[tuple[str, str]] = []
         self.replies: list[tuple[str, str, str]] = []
 
-    async def send_notice(self, room_id: str, body: str) -> MatrixSendResult:
+    async def send_notice(
+        self, room_id: str, body: str, *, tx_id: str | None = None
+    ) -> MatrixSendResult:
         self.notices.append((room_id, body))
         return MatrixSendResult(event_id="$notice", room_id=room_id)
 
@@ -104,6 +106,8 @@ class FakeDeliveryMessages:
     async def get_by_matrix_event(
         self, *, matrix_room_id: str, matrix_event_id: str
     ) -> DeliveryMessageRecord | None:
+        if matrix_event_id != "$parent":
+            return None
         return DeliveryMessageRecord(
             id=1,
             discourse_topic_id=20,

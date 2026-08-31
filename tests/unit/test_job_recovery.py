@@ -88,7 +88,9 @@ class FakeMatrixClient:
         self.tx_ids.append(tx_id)
         return MatrixSendResult(event_id=f"$text-{len(self.texts)}", room_id=room_id)
 
-    async def send_notice(self, room_id: str, body: str) -> MatrixSendResult:
+    async def send_notice(
+        self, room_id: str, body: str, *, tx_id: str | None = None
+    ) -> MatrixSendResult:
         return MatrixSendResult(event_id="$notice", room_id=room_id)
 
     async def send_reply(
