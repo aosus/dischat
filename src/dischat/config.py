@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     config_file: Path = Field(default=Path("config.yaml"), alias="CONFIG_FILE")
     default_locale: Locale = Field(default="ar", alias="DEFAULT_LOCALE")
     discourse_test_category_id: int | None = Field(default=None, alias="DISCOURSE_TEST_CATEGORY_ID")
+    # Retention window (days) for confirmed (status='processed') rows in the
+    # matrix_event_state ledger. Only the /sync replay horizon strictly needs
+    # them; seven days is comfortably beyond any realistic horizon.
+    matrix_event_retention_days: int = Field(default=7, alias="MATRIX_EVENT_RETENTION_DAYS")
 
     def load_file_config(self) -> FileConfig:
         if not self.config_file.exists():

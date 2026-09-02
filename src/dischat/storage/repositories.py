@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
@@ -12,6 +13,18 @@ from dischat.security.audit import AuditEntry
 WatchMode = Literal["category", "all_public_categories"]
 JobStatus = Literal["pending", "running", "complete", "failed"]
 TargetType = Literal["dm", "room"]
+MatrixEventStatus = Literal["claimed", "owned", "written", "processed"]
+
+# How long a processing lease is held before a replaying attempt may take the
+# fence over. Generous relative to normal processing latency but short enough
+# that a crashed worker does not stall an event forever.
+DEFAULT_LEASE_SECONDS = 900
+
+
+def new_lease_owner() -> str:
+    """Fresh per-attempt ownership token for the event fence."""
+    return secrets.token_urlsafe(16)
+
 
 # Default lease for claimed delivery jobs; a 'running' job becomes claimable
 # again once its lease expires (crashed-worker recovery window).
@@ -125,6 +138,26 @@ class DeliveryMessageRecord:
     target_type: TargetType
     target_mxid: str | None
     parent_delivery_message_id: int | None
+
+
+@dataclass(slots=True, frozen=True)
+class MatrixEventStateRecord:
+    id: int
+    room_id: str
+    event_id: str
+    status: MatrixEventStatus
+    discourse_topic_id: int | None = None
+    discourse_post_id: int | None = None
+    response_notice: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class EventOutcome:
+    """Result of attempting to record an external write in the ledger."""
+
+    recorded: bool
+    conflicting_topic_id: int | None = None
+    conflicting_post_id: int | None = None
 
 
 def _record_to_chat_account(row: asyncpg.Record) -> ChatAccount:
@@ -1461,3 +1494,301 @@ class AuditLogRepository:
                 entry.error_message,
                 datetime.now(UTC),
             )
+
+
+class MatrixStateRepository:
+    """Durable state for restart-safe Matrix processing (sync token + event ledger)."""
+
+    def __init__(self, pool: asyncpg.Pool) -> None:
+        self._pool = pool
+
+    async def get_sync_next_batch(self) -> str | None:
+        async with self._pool.acquire() as connection:
+            row = await connection.fetchrow("SELECT next_batch FROM matrix_sync_state")
+        if row is None:
+            return None
+        return str(row["next_batch"])
+
+    async def set_sync_next_batch(self, next_batch: str) -> None:
+        async with self._pool.acquire() as connection:
+            await connection.execute(
+                """
+                INSERT INTO matrix_sync_state (singleton, next_batch, updated_at)
+                VALUES (TRUE, $1, NOW())
+                ON CONFLICT (singleton)
+                DO UPDATE SET next_batch = EXCLUDED.next_batch, updated_at = NOW()
+                """,
+                next_batch,
+            )
+
+    async def claim_event(
+        self,
+        *,
+        matrix_room_id: str,
+        matrix_event_id: str,
+        lease_owner: str | None = None,
+        lease_seconds: int = DEFAULT_LEASE_SECONDS,
+    ) -> MatrixEventStateRecord | None:
+        """Seed the marker row and take an exclusive processing lease.
+
+        The INSERT is the durable fence: it wins the unique
+        ``(room_id, event_id)`` boundary, so exactly one concurrent attempt
+        proceeds to the external Discourse write. The lease columns make the
+        claim auditable and let a replaying attempt take over only a
+        demonstrably stale lease.
+        """
+        async with self._pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                INSERT INTO matrix_event_state (
+                    room_id,
+                    event_id,
+                    status,
+                    lease_owner,
+                    lease_expires_at,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    $1, $2, 'claimed', $3::text,
+                    CASE WHEN $3::text IS NULL THEN NULL
+                         ELSE NOW() + make_interval(secs => $4::double precision) END,
+                    NOW(), NOW()
+                )
+                ON CONFLICT (room_id, event_id) DO UPDATE SET
+                    lease_expires_at = CASE WHEN $3::text IS NULL THEN NULL
+                        ELSE NOW() + make_interval(secs => $4::double precision) END,
+                    updated_at = NOW()
+                WHERE matrix_event_state.status = 'claimed'
+                  AND $3::text IS NOT NULL
+                  AND matrix_event_state.lease_owner = $3::text
+                RETURNING id, room_id, event_id, status,
+                          discourse_topic_id, discourse_post_id, response_notice
+                """,
+                matrix_room_id,
+                matrix_event_id,
+                lease_owner,
+                lease_seconds,
+            )
+        return _record_to_matrix_event_state(row) if row is not None else None
+
+    async def adopt_event(
+        self,
+        *,
+        matrix_room_id: str,
+        matrix_event_id: str,
+        lease_owner: str,
+        lease_seconds: int = DEFAULT_LEASE_SECONDS,
+    ) -> MatrixEventStateRecord | None:
+        """Atomically take exclusive ownership of an orphaned marker.
+
+        Exactly one concurrent caller can win this transition: the row moves
+        from ``claimed``/``owned`` to the ``owned`` state under the caller's
+        ``lease_owner`` token, so a loser gets ``None`` back and must not
+        perform the external write. Takeover only succeeds when the fence is
+        demonstrably stale — either the previous owner never held a lease (a
+        pre-lease marker) or its lease has already lapsed — so a live worker
+        is never dispossessed. A fence that lapsed *before* adoption (status
+        ``claimed``) and one that lapsed *after* adoption but before any
+        external write (status ``owned``, e.g. the process died between the
+        write call returning and ``mark_event_written``) are both recoverable;
+        ``written``/``processed`` markers are not.
+
+        Returns the owned record when this caller now holds the fence;
+        ``None`` otherwise (another attempt owns it, or an outcome was
+        already recorded as ``written``/``processed``).
+        """
+        if lease_owner is None:
+            raise ValueError("lease_owner is required to adopt an event")
+        async with self._pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                UPDATE matrix_event_state
+                SET status = 'owned',
+                    lease_owner = $3,
+                    lease_expires_at = NOW() + make_interval(secs => $4::double precision),
+                    updated_at = NOW()
+                WHERE room_id = $1 AND event_id = $2
+                  AND status IN ('claimed', 'owned')
+                  AND (
+                      lease_expires_at IS NULL
+                      OR lease_expires_at <= NOW()
+                  )
+                RETURNING id, room_id, event_id, status,
+                          discourse_topic_id, discourse_post_id, response_notice
+                """,
+                matrix_room_id,
+                matrix_event_id,
+                lease_owner,
+                lease_seconds,
+            )
+        return _record_to_matrix_event_state(row) if row is not None else None
+
+    async def mark_event_written(
+        self,
+        *,
+        matrix_room_id: str,
+        matrix_event_id: str,
+        discourse_topic_id: int | None = None,
+        discourse_post_id: int | None = None,
+        response_notice: str | None = None,
+        lease_owner: str | None = None,
+    ) -> EventOutcome:
+        """Durably record the external write of a fenced event.
+
+        This is the reconciliation primitive behind both reply and command
+        fencing: the row answers "did an external write already happen, and
+        what did it produce?". A crash between the external write and the
+        delivery mapping leaves a ``written`` marker, and the replay adopts
+        the recorded outcome instead of writing a duplicate.
+
+        Only the attempt that holds the fence may stamp its outcome here:
+        with ``lease_owner`` set, the marker must still be in the state this
+        attempt left it in (``claimed`` for a fresh claim, ``owned`` after an
+        adoption) and carry this attempt's lease token. A superseded attempt
+        — one that raced a takeover and lost — therefore cannot overwrite the
+        winner's record; it learns the winning outcome and must surface that
+        instead of its own.
+        """
+        async with self._pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                UPDATE matrix_event_state
+                SET status = 'written',
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    discourse_topic_id = COALESCE($3, discourse_topic_id),
+                    discourse_post_id = COALESCE($4, discourse_post_id),
+                    response_notice = COALESCE($5, response_notice),
+                    updated_at = NOW()
+                WHERE room_id = $1 AND event_id = $2
+                  AND status IN ('claimed', 'owned')
+                  AND ($6::text IS NULL OR lease_owner = $6::text)
+                RETURNING discourse_topic_id, discourse_post_id
+                """,
+                matrix_room_id,
+                matrix_event_id,
+                discourse_topic_id,
+                discourse_post_id,
+                response_notice,
+                lease_owner,
+            )
+            if row is not None:
+                topic_id = row["discourse_topic_id"]
+                return EventOutcome(
+                    recorded=True,
+                    conflicting_topic_id=int(topic_id) if topic_id is not None else None,
+                    conflicting_post_id=int(row["discourse_post_id"])
+                    if row["discourse_post_id"] is not None
+                    else None,
+                )
+            existing = await self.get_event(
+                matrix_room_id=matrix_room_id, matrix_event_id=matrix_event_id
+            )
+        return EventOutcome(
+            recorded=False,
+            conflicting_topic_id=existing.discourse_topic_id if existing else None,
+            conflicting_post_id=existing.discourse_post_id if existing else None,
+        )
+
+    async def mark_event_processed(
+        self,
+        *,
+        matrix_room_id: str,
+        matrix_event_id: str,
+        lease_owner: str | None = None,
+    ) -> None:
+        """Confirm the marker once all side effects are durably recorded.
+
+        Like every other ledger primitive, the transition is guarded: with a
+        lease token the marker must still belong to this attempt, and it must
+        be in a pre-confirmation state (``claimed``/``owned``/``written``).
+        A caller that lost the fence — or one racing a just-confirmed
+        replay — updates nothing instead of confirming over the winner.
+        """
+        async with self._pool.acquire() as connection:
+            await connection.execute(
+                """
+                UPDATE matrix_event_state
+                SET status = 'processed', updated_at = NOW()
+                WHERE room_id = $1 AND event_id = $2
+                  AND status IN ('claimed', 'owned', 'written')
+                  AND ($3::text IS NULL OR lease_owner = $3::text)
+                """,
+                matrix_room_id,
+                matrix_event_id,
+                lease_owner,
+            )
+
+    async def prune_processed_events(self, *, older_than_days: int = 7) -> int:
+        """Delete confirmed markers past the retention window.
+
+        The fence only needs a ``processed`` marker to outlive the Matrix
+        ``/sync`` replay horizon (bounded by the stored sync token), so old
+        confirmed rows are safe to drop. Rows in ``claimed``, ``owned``, or
+        ``written`` states are never deleted: removing one could re-open an
+        external write. Returns the number of rows removed.
+        """
+        async with self._pool.acquire() as connection:
+            status = await connection.execute(
+                """
+                DELETE FROM matrix_event_state
+                WHERE status = 'processed'
+                  AND updated_at < NOW() - make_interval(days => $1::int)
+                """,
+                older_than_days,
+            )
+        return int(status.split()[-1])
+
+    async def get_event(
+        self, *, matrix_room_id: str, matrix_event_id: str
+    ) -> MatrixEventStateRecord | None:
+        async with self._pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT id, room_id, event_id, status,
+                       discourse_topic_id, discourse_post_id, response_notice
+                FROM matrix_event_state
+                WHERE room_id = $1 AND event_id = $2
+                """,
+                matrix_room_id,
+                matrix_event_id,
+            )
+        return _record_to_matrix_event_state(row) if row is not None else None
+
+    async def release_event(
+        self, *, matrix_room_id: str, matrix_event_id: str, lease_owner: str | None = None
+    ) -> None:
+        """Give up an unprocessed claim so a later delivery can retry cleanly.
+
+        Only a marker that provably made no external write can be released:
+        once the outcome is recorded (``written``) or confirmed
+        (``processed``), the fence must survive so a replay never re-writes.
+        With ``lease_owner`` set, the marker must still carry this attempt's
+        token — a superseded attempt must never tear down the fence of the
+        attempt that took the lease over.
+        """
+        async with self._pool.acquire() as connection:
+            await connection.execute(
+                """
+                DELETE FROM matrix_event_state
+                WHERE room_id = $1 AND event_id = $2
+                  AND status IN ('claimed', 'owned')
+                  AND ($3::text IS NULL OR lease_owner = $3::text)
+                """,
+                matrix_room_id,
+                matrix_event_id,
+                lease_owner,
+            )
+
+
+def _record_to_matrix_event_state(row: asyncpg.Record) -> MatrixEventStateRecord:
+    return MatrixEventStateRecord(
+        id=row["id"],
+        room_id=row["room_id"],
+        event_id=row["event_id"],
+        status=row["status"],
+        discourse_topic_id=row["discourse_topic_id"],
+        discourse_post_id=row["discourse_post_id"],
+        response_notice=row["response_notice"],
+    )

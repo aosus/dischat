@@ -280,6 +280,7 @@ async def test_run_iteration_syncs_processes_and_returns_next_batch(monkeypatch)
         discourse_events=object(),
         user_watches=object(),
         delivery_jobs=object(),
+        matrix_state=None,
     )
     settings = SimpleNamespace(
         poll_interval_seconds=15,
@@ -330,6 +331,7 @@ async def test_run_iteration_uses_long_poll_after_initial_sync(monkeypatch) -> N
         discourse_events=object(),
         user_watches=object(),
         delivery_jobs=object(),
+        matrix_state=None,
     )
     settings = SimpleNamespace(
         poll_interval_seconds=15,

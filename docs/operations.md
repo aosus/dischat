@@ -79,3 +79,62 @@ Monitoring recommendations:
 - alert on `status = 'running' AND lease_expires_at < NOW()` persisting across
   more than one poll cycle — it suggests a repeatedly dying worker rather than
   a single crash.
+
+## Restart safety and idempotency
+
+The Matrix `/sync` continuation token lives in the `matrix_sync_state` table.
+On startup, Dischat loads it and resumes long-polling from there; only when no
+token has ever been stored does it perform a fresh initial sync. The token is
+written after each iteration completes its side effects (event processing,
+Discourse polling, delivery drain), so a restart can replay at most one batch —
+and batch replay is itself safe because of the event fence below.
+
+Inbound Matrix events with external side effects — reply events (relayed to
+Discourse as replies) and side-effecting command events such as `/pair`
+(which sends a Discourse DM) — are both gated by the `matrix_event_state`
+ledger: `claim` (insert marker + exclusive lease, unique per room+event)
+happens before any Discourse write, the write outcome is recorded on the
+marker as soon as the external write returns, and `confirm`
+(`status = 'processed'`) happens only after the reply, its
+`delivery_messages` mapping, and the room notice are all committed. Each
+processing attempt holds a random lease token; only the lease holder may
+record a write outcome, release the fence, or confirm the marker.
+Consequences:
+
+- processing the same event twice produces exactly one Discourse write;
+- a replay racing a live worker always loses the fence (the worker's lease is
+  fresh) and never writes a second time;
+- if the process dies before the external write, a replay takes the fence
+  over once the lease lapses and delivers the event exactly once;
+- if the process dies after the Discourse write and after the outcome was
+  recorded but before the `delivery_messages` mapping is committed, the
+  marker is reconciled from the recorded outcome: the reply is never written
+  twice;
+- in-process failures before any external write (Discourse error responses)
+  release a fence the attempt still owns, so a later delivery of the same
+  event retries cleanly.
+
+Residual duplicate window: there is a gap between Discourse accepting the
+write and the outcome being durably recorded (recording the outcome is a
+separate ledger write that runs after the HTTP call returns). If the process
+dies inside that gap, the durable marker shows no outcome and, once the lease
+lapses, a replay performs the write again — Discourse offers no idempotency
+primitive that would let the bridge predict or dedupe the post beforehand. The
+fence therefore guarantees exactly-once side effects for every crash point
+except this one, where behavior is at-least-once with a bounded window.
+
+Mixed-version rolling upgrade: while an old-version process (before the lease
+migration) still runs next to a new-version one, a pre-lease `claimed` marker
+has NULL lease fields and is immediately adoptable by the new version —
+without waiting for any takeover window. An old-version worker holding such a
+marker mid-write can therefore have its fence adopted and the event written
+again by a new-version worker. Deploy upgrades in a single restart (drain the
+old process before starting the new one) rather than running mixed versions
+through a sync batch.
+
+Ledger retention: `matrix_event_state` accumulates one row per inbound
+side-effecting Matrix event. Every iteration deletes `processed` rows older
+than `MATRIX_EVENT_RETENTION_DAYS` (default 7 — comfortably longer than any
+`/sync` replay horizon, which is bounded by the stored sync token); claimed,
+owned, and written rows are never touched by retention. The delete is
+supported by a partial index on `updated_at` for `status = 'processed'`.

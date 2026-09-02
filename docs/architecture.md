@@ -20,6 +20,17 @@ Current implemented runtime slices:
 - Matrix sync is used to accept invites and inspect incoming text messages
 - slash commands are persisted through PostgreSQL-backed pairing and watch state
 - Matrix replies to bridged messages can post back to Discourse
+- the Matrix `/sync` continuation token is persisted in PostgreSQL
+  (`matrix_sync_state`) so restarts resume from the last fully processed batch
+  instead of performing a fresh initial sync
+- inbound Matrix replies and side-effecting slash commands such as `/pair`
+  are processed through a durable idempotency fence (`matrix_event_state`):
+  an event marker with an exclusive processing lease is claimed before any
+  Discourse write, replays short-circuit on the unique constraint, a crashed
+  attempt's fence is taken over only after its lease lapses, the external
+  write outcome is recorded on the marker as soon as the write returns, and
+  the marker is confirmed only after the reply, its delivery mapping, and
+  the room notice are durably recorded
 - Discourse polling stores normalized events and enqueues delivery jobs
 - delivery jobs are claimed atomically with `FOR UPDATE SKIP LOCKED`
 - the main runtime continuously long-polls Matrix, polls Discourse, and drains queued deliveries

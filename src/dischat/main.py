@@ -143,6 +143,7 @@ async def run_iteration(
         room_links=context.room_links,
         delivery_messages=context.delivery_messages,
         audit_logs=context.audit_logs,
+        event_state=getattr(context, "matrix_state", None),
         relay_matrix_username=settings.discourse_relay_matrix_username,
         relay_telegram_username=settings.discourse_relay_telegram_username,
         relay_discord_username=settings.discourse_relay_discord_username,
@@ -175,8 +176,31 @@ async def run_iteration(
     delivered = await drain_delivery_jobs(context)
     if delivered:
         logger.info("Delivered %s Matrix jobs", delivered)
+    # Ledger retention: confirmed ('processed') markers past the window are
+    # dead weight — the fence only needs them to outlive the /sync replay
+    # horizon. Pruning every iteration keeps matrix_event_state bounded with
+    # traffic; claimed/owned/written rows are never touched (removing one
+    # could re-open an external write). Failures here must not fail the
+    # iteration: retention is housekeeping, not a correctness step.
+    if context_has_matrix_state(context):
+        try:
+            await context.matrix_state.prune_processed_events(
+                older_than_days=settings.matrix_event_retention_days
+            )
+        except Exception:  # pragma: no cover - defensive: retention is best-effort
+            logger.warning("matrix_event_state retention prune failed", exc_info=True)
     next_batch = getattr(sync_response, "next_batch", None)
+    if isinstance(next_batch, str) and context_has_matrix_state(context):
+        # Persist the /sync continuation token durably. It is written only
+        # after the batch's side effects (event processing, Discourse polling,
+        # delivery drain) completed, so a restart resumes from the last fully
+        # processed batch instead of replaying or skipping one.
+        await context.matrix_state.set_sync_next_batch(next_batch)
     return next_batch if isinstance(next_batch, str) else sync_since
+
+
+def context_has_matrix_state(context) -> bool:
+    return getattr(context, "matrix_state", None) is not None
 
 
 async def run() -> None:
@@ -201,7 +225,9 @@ async def run() -> None:
         )
 
         poll_state = PollerState()
-        sync_since: str | None = None
+        sync_since: str | None = await context.matrix_state.get_sync_next_batch()
+        if sync_since is not None:
+            logger.info("Resuming Matrix sync from persisted token %s", sync_since)
         while True:
             sync_since = await run_iteration(
                 context=context,
