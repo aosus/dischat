@@ -160,7 +160,3 @@ class PairingService:
 
     def render_message(self, result: PairingResult, locale: str) -> str:
         return translate(result.message_key, locale)
-
-
-def backoff_delay(attempts: int) -> datetime:
-    return datetime.now(UTC) + timedelta(seconds=min(300, 2**attempts))

@@ -298,7 +298,12 @@ class PairingSessionRepository:
         async with self._pool.acquire() as connection:
             async with connection.transaction():
                 await connection.execute(
-                    "DELETE FROM pairing_sessions WHERE mxid = $1 AND consumed_at IS NULL", mxid
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", mxid
+                )
+                await connection.execute(
+                    "UPDATE pairing_sessions SET consumed_at = NOW() "
+                    "WHERE mxid = $1 AND consumed_at IS NULL",
+                    mxid,
                 )
                 row = await connection.fetchrow(
                     """
@@ -335,33 +340,31 @@ class PairingSessionRepository:
             )
         return _record_to_pairing_session(row) if row is not None else None
 
-    async def increment_attempt_count(self, session_id: int) -> PairingSessionRecord:
+    async def increment_attempt_count(self, session_id: int) -> PairingSessionRecord | None:
         async with self._pool.acquire() as connection:
             row = await connection.fetchrow(
                 """
                 UPDATE pairing_sessions
                 SET attempt_count = attempt_count + 1
-                WHERE id = $1
+                WHERE id = $1 AND consumed_at IS NULL
                 RETURNING *
                 """,
                 session_id,
             )
-        assert row is not None
-        return _record_to_pairing_session(row)
+        return _record_to_pairing_session(row) if row is not None else None
 
-    async def consume_session(self, session_id: int) -> PairingSessionRecord:
+    async def consume_session(self, session_id: int) -> PairingSessionRecord | None:
         async with self._pool.acquire() as connection:
             row = await connection.fetchrow(
                 """
                 UPDATE pairing_sessions
                 SET consumed_at = NOW()
-                WHERE id = $1
+                WHERE id = $1 AND consumed_at IS NULL
                 RETURNING *
                 """,
                 session_id,
             )
-        assert row is not None
-        return _record_to_pairing_session(row)
+        return _record_to_pairing_session(row) if row is not None else None
 
     async def cancel_session(self, mxid: str) -> None:
         async with self._pool.acquire() as connection:
@@ -384,6 +387,133 @@ class PairingRateLimitRepository:
 
     def __init__(self, pool: asyncpg.Pool) -> None:
         self._pool = pool
+
+    async def reserve_issuance(
+        self,
+        *,
+        mxid: str,
+        discourse_username: str,
+        now: datetime,
+        window: timedelta,
+        max_issuances: int,
+    ) -> datetime | None:
+        """Atomically reserve both user and target rolling-window capacity."""
+        target = discourse_username.lower()
+        cutoff = now - window
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", mxid
+                )
+                # Opportunistic global retention: issuance is the only path
+                # that grows these tables, so pruning here bounds stale user
+                # identifiers without a separate scheduler.
+                await connection.execute(
+                    "DELETE FROM pairing_issuance_events WHERE issued_at <= $1",
+                    cutoff,
+                )
+                await connection.execute(
+                    """
+                    DELETE FROM pairing_rate_limits
+                    WHERE updated_at <= $1
+                      AND (cooldown_until IS NULL OR cooldown_until <= $2)
+                    """,
+                    cutoff,
+                    now,
+                )
+                cooldown_rows = await connection.fetch(
+                    """
+                    SELECT cooldown_until
+                    FROM pairing_rate_limits
+                    WHERE mxid = $1
+                      AND COALESCE(discourse_username, '') = ANY($2::text[])
+                      AND cooldown_until > $3
+                    """,
+                    mxid,
+                    ["", target],
+                    now,
+                )
+                if cooldown_rows:
+                    return max(row["cooldown_until"] for row in cooldown_rows)
+                rows = await connection.fetch(
+                    """
+                    SELECT discourse_username, COUNT(*) AS count, MIN(issued_at) AS oldest
+                    FROM pairing_issuance_events
+                    WHERE mxid = $1 AND discourse_username = ANY($2::text[])
+                    GROUP BY discourse_username
+                    """,
+                    mxid,
+                    ["", target],
+                )
+                blocked = [row for row in rows if row["count"] >= max_issuances]
+                if blocked:
+                    return max(row["oldest"] + window for row in blocked)
+                await connection.executemany(
+                    "INSERT INTO pairing_issuance_events "
+                    "(mxid, discourse_username, issued_at) VALUES ($1, $2, $3)",
+                    [(mxid, "", now), (mxid, target, now)],
+                )
+        return None
+
+    async def record_failure_and_apply_cooldown(
+        self,
+        *,
+        mxid: str,
+        discourse_username: str,
+        now: datetime,
+        max_failures: int,
+        cooldown: timedelta,
+    ) -> datetime | None:
+        """Update user and target failure scopes in one locked transaction."""
+        target = discourse_username.lower()
+        armed_until: datetime | None = None
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", mxid
+                )
+                for username in (None, target):
+                    row = await connection.fetchrow(
+                        """
+                        INSERT INTO pairing_rate_limits
+                            (mxid, discourse_username, failure_count, updated_at)
+                        VALUES ($1, $2, 1, $3)
+                        ON CONFLICT (mxid, COALESCE(discourse_username, '')) DO UPDATE SET
+                            failure_count = CASE
+                                WHEN pairing_rate_limits.cooldown_until IS NOT NULL
+                                 AND pairing_rate_limits.cooldown_until <= $3 THEN 1
+                                ELSE pairing_rate_limits.failure_count + 1 END,
+                            cooldown_until = CASE
+                                WHEN pairing_rate_limits.cooldown_until IS NOT NULL
+                                 AND pairing_rate_limits.cooldown_until <= $3 THEN NULL
+                                ELSE pairing_rate_limits.cooldown_until END,
+                            updated_at = $3
+                        RETURNING failure_count, cooldown_until
+                        """,
+                        mxid,
+                        username,
+                        now,
+                    )
+                    assert row is not None
+                    active = row["cooldown_until"] is not None and now < row["cooldown_until"]
+                    if row["failure_count"] >= max_failures and not active:
+                        candidate = now + cooldown
+                        await connection.execute(
+                            """
+                            UPDATE pairing_rate_limits
+                            SET failure_count = 0,
+                                cooldown_until = GREATEST(COALESCE(cooldown_until, $3), $3),
+                                updated_at = $4
+                            WHERE mxid = $1
+                              AND COALESCE(discourse_username, '') = COALESCE($2, '')
+                            """,
+                            mxid,
+                            username,
+                            candidate,
+                            now,
+                        )
+                        armed_until = max(armed_until or candidate, candidate)
+        return armed_until
 
     @staticmethod
     def _record_to_state(row: asyncpg.Record) -> PairingRateLimitState:

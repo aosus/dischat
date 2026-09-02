@@ -227,12 +227,8 @@ class FakePairingRateLimits:
     def advance(self, delta: timedelta) -> None:
         self.now += delta
 
-    async def get_state(
-        self, *, mxid: str, discourse_username: str | None
-    ) -> PairingRateLimitState | None:
-        state = self._rows.get(self._key(mxid, discourse_username))
-        if state is None:
-            return None
+    @staticmethod
+    def _copy(state: PairingRateLimitState) -> PairingRateLimitState:
         return PairingRateLimitState(
             mxid=state.mxid,
             discourse_username=state.discourse_username,
@@ -241,6 +237,85 @@ class FakePairingRateLimits:
             window_started_at=state.window_started_at,
             cooldown_until=state.cooldown_until,
         )
+
+    async def get_state(
+        self, *, mxid: str, discourse_username: str | None
+    ) -> PairingRateLimitState | None:
+        state = self._rows.get(self._key(mxid, discourse_username))
+        if state is None:
+            return None
+        return self._copy(state)
+
+    async def reserve_issuance(
+        self,
+        *,
+        mxid: str,
+        discourse_username: str,
+        now: datetime,
+        window: timedelta,
+        max_issuances: int,
+    ) -> datetime | None:
+        target = discourse_username.lower()
+        states = [
+            self._rows.get(self._key(mxid, None)),
+            self._rows.get(self._key(mxid, target)),
+        ]
+        active_cooldowns = [
+            state.cooldown_until
+            for state in states
+            if state is not None and state.cooldown_until is not None and state.cooldown_until > now
+        ]
+        if active_cooldowns:
+            return max(active_cooldowns)
+        for state in states:
+            if (
+                state is not None
+                and now < state.window_started_at + window
+                and state.issuance_count >= max_issuances
+            ):
+                return state.window_started_at + window
+        for username in (None, target):
+            await self.record_issuance(
+                mxid=mxid,
+                discourse_username=username,
+                now=now,
+                window=window,
+            )
+        return None
+
+    async def record_failure_and_apply_cooldown(
+        self,
+        *,
+        mxid: str,
+        discourse_username: str,
+        now: datetime,
+        max_failures: int,
+        cooldown: timedelta,
+    ) -> datetime | None:
+        armed_until: datetime | None = None
+        for username in (None, discourse_username.lower()):
+            state = self._rows.get(self._key(mxid, username))
+            if state is None:
+                state = PairingRateLimitState(
+                    mxid=mxid,
+                    discourse_username=username,
+                    issuance_count=0,
+                    failure_count=0,
+                    window_started_at=now,
+                    cooldown_until=None,
+                )
+                self._rows[self._key(mxid, username)] = state
+            if state.cooldown_until is not None and state.cooldown_until <= now:
+                state.failure_count = 0
+                state.cooldown_until = None
+            state.failure_count += 1
+            if state.failure_count >= max_failures and not (
+                state.cooldown_until is not None and state.cooldown_until > now
+            ):
+                state.failure_count = 0
+                state.cooldown_until = now + cooldown
+                armed_until = max(armed_until or state.cooldown_until, state.cooldown_until)
+        return armed_until
 
     async def record_issuance(
         self,
@@ -265,8 +340,7 @@ class FakePairingRateLimits:
             )
             self._rows[self._key(mxid, discourse_username)] = state
         state.issuance_count += 1
-        assert state is not None
-        return state
+        return self._copy(state)
 
     async def record_failure(
         self, *, mxid: str, discourse_username: str | None, now: datetime
@@ -283,8 +357,7 @@ class FakePairingRateLimits:
             )
             self._rows[self._key(mxid, discourse_username)] = state
         state.failure_count += 1
-        assert state is not None
-        return state
+        return self._copy(state)
 
     async def apply_cooldown(
         self,
@@ -530,6 +603,11 @@ async def test_failed_verification_cooldown_persists_across_new_sessions() -> No
     assert "Too many pairing attempts" in verify_attempt.body
 
     rate_limits.advance(COOLDOWN + timedelta(seconds=1))
+    recovered = await service.handle_message(
+        mxid="@carol:aosus.org", platform="matrix", body="/pair dave", locale="en"
+    )
+    assert recovered is not None
+    assert recovered.pairing_code_to_deliver is not None
 
 
 async def test_verification_succeeds_after_max_issuances() -> None:
