@@ -18,6 +18,7 @@ from dischat.storage.repositories import (
     DeliveryJobRepository,
     DeliveryMessageRepository,
     DiscourseEventRepository,
+    PairingRateLimitRepository,
     PairingSessionRepository,
     RoomLinkRepository,
     UserWatchRepository,
@@ -40,6 +41,7 @@ class AppContext:
     delivery_jobs: DeliveryJobRepository
     delivery_messages: DeliveryMessageRepository
     audit_logs: AuditLogRepository
+    pairing_rate_limits: PairingRateLimitRepository
     service: DischatService
 
     async def close(self) -> None:
@@ -72,12 +74,14 @@ async def build_context(settings: Settings) -> AppContext:
     delivery_jobs = DeliveryJobRepository(pool)
     delivery_messages = DeliveryMessageRepository(pool)
     audit_logs = AuditLogRepository(pool)
+    pairing_rate_limits = PairingRateLimitRepository(pool)
     service = DischatService(
         chat_accounts=chat_accounts,
         pairing_sessions=pairing_sessions,
         categories=categories,
         user_watches=user_watches,
         pairing_service=PairingService(),
+        pairing_rate_limits=pairing_rate_limits,
     )
     return AppContext(
         pool=pool,
@@ -94,5 +98,6 @@ async def build_context(settings: Settings) -> AppContext:
         delivery_jobs=delivery_jobs,
         delivery_messages=delivery_messages,
         audit_logs=audit_logs,
+        pairing_rate_limits=pairing_rate_limits,
         service=service,
     )

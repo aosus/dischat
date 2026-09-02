@@ -41,6 +41,10 @@ MESSAGES: Final[dict[str, dict[Locale, str]]] = {
         "en": "That code is invalid or expired.",
         "ar": "هذا الرمز غير صالح أو منتهي الصلاحية.",
     },
+    "pairing.rate_limited": {
+        "en": "Too many pairing attempts. Try again in {minutes} minute(s).",
+        "ar": "محاولات كثيرة جدًا لربط الحساب. حاول مجددًا بعد {minutes} دقيقة/دقائق.",
+    },
     "posting.requires_pairing": {
         "en": "I can’t post this to Discourse because this room requires pairing.\n\nUse:\n/pair <username>",
         "ar": "لا يمكنني نشر هذه الرسالة في ديسكورس لأن هذه الغرفة تتطلب ربط الحساب أولًا.\n\nاستخدم:\n/pair <username>",

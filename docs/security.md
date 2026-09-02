@@ -6,6 +6,20 @@ Security rules implemented in this baseline:
 - pairing codes expire
 - pairing codes are single-use
 - raw pairing codes are not stored in the database model
+- pairing-code issuance is rate limited persistently per Matrix user and per
+  requested Discourse username (default: 3 issuances per rolling 1-hour window,
+  stored server-side so starting a new session cannot reset it)
+- failed code-verification attempts are counted persistently per Matrix user
+  and per requested Discourse username across sessions; reaching the threshold
+  (default: 5) applies a cooldown (default: 15 minutes) that blocks both new
+  `/pair` issuances and further verification attempts until it expires
+- verification is gated only by active cooldowns: exhausting the issuance
+  window does not prevent a user from verifying a code they were already sent
+- cooldowns re-arm: when one expires, the failure counter resets and the next
+  `max_failures` failed attempts apply a fresh cooldown (protection is not
+  disabled after the first cooldown)
+- the per-session attempt cap remains as a secondary control (5 attempts per
+  active pairing session)
 - posting identity must come from pairing or relay configuration
 - live test category checks fail closed for unexpected category IDs
 - public-category enforcement gates polling and routing (see below)
@@ -83,7 +97,6 @@ revalidation must never leave the last-known snapshot in charge:
 
 ## Still to complete in runtime code
 
-- persistent pairing attempt rate limits
 - audit persistence for every live write path
 
 Deployment secrets hygiene:
