@@ -69,9 +69,12 @@ Discourse category listing **before every production poll** — not on a timer. 
 deliberately no cadence knob: any interval between the snapshot and the poll would be a
 window in which a stored `is_public=TRUE` flag is an unverified claim, so a category an
 admin just made read-restricted could keep being routed until the next scheduled
-refresh. Revalidating per poll closes that window entirely: a visibility change is
-picked up by the very next poll (bounded by `POLL_INTERVAL_SECONDS`, which also paces
-the category listing call), and a newly public category opens up just as fast.
+refresh. Revalidating per poll prevents a stale snapshot from being reused across poll
+iterations: a visibility change is picked up by the next poll (bounded by
+`POLL_INTERVAL_SECONDS`, which also paces the category listing call), and a newly public
+category opens up just as fast. Discourse does not expose an atomic "visibility plus
+post" read, so an unavoidable distributed race remains between a successful category
+read and the immediately following post read.
 
 Because the visibility revalidation is the only thing that keeps the stored
 `is_public`/`enabled` flags honest — and because the Discourse client's admin API key
@@ -82,24 +85,80 @@ revalidation must never leave the last-known snapshot in charge:
   **polling is suspended entirely** until a refresh succeeds. `run_iteration` passes the
   stale flag into `poll_once`, which skips the whole Discourse poll (nothing is read, no
   events are created, no delivery jobs are enqueued, and `last_seen_post_id` does not
-  advance). This closes both the `public -> private` + refresh-outage window and the
-  quieter `public -> private` between two successful refreshes: no poll ever runs
-  against an unverified snapshot.
+  advance). This closes the `public -> private` + refresh-outage window and prevents a
+  snapshot from surviving between iterations: no poll runs against a snapshot that was
+  not refreshed during that same iteration.
 - While stale, the revalidation is retried on **every** iteration, so the outage window
   is as short as the category listing allows. A successful refresh revalidates the
   snapshot and clears the flag.
 - The stale-snapshot gate also lives inside `poll_once` itself (defense in depth), so
   any direct caller passing a stale state gets the same fail-closed behavior.
-- Posts skipped while a category was private are re-evaluated if it later becomes
-  public again (they never advanced `last_seen_post_id`); Matrix sync/commands and
-  delivery of already-enqueued jobs are unaffected by the suspension. The live-E2E test
-  category is exempt, since it never consults the visibility snapshot.
-
-## Still to complete in runtime code
-
-- audit persistence for every live write path
+- Once a fresh snapshot proves a post belongs to a private/disabled category,
+  the durable scan cursor advances past it. Content observed as private is
+  never retroactively delivered merely because the category later becomes
+  public. Matrix sync/commands remain available during a refresh suspension,
+  while already-enqueued production jobs are paused until a fresh pre-drain
+  visibility check succeeds. The live-E2E test category is exempt, since it
+  never consults the visibility snapshot.
 
 Deployment secrets hygiene:
 
-- the example `dischat/dischat` database credentials in `docker-compose.yml` are development-only; set a strong `POSTGRES_PASSWORD` in `.env` (git-ignored) before any real deployment
+- the bundled deployment uses a bootstrap `dischat_admin` role and a separate
+  non-superuser `dischat` runtime/migration role; set different strong
+  `POSTGRES_ADMIN_PASSWORD` and `POSTGRES_PASSWORD` values in `.env`
+- `.dockerignore` excludes `.env*` and runtime `config*.yaml` files; Compose
+  mounts `config.yaml` read-only so credentials and room mappings do not enter
+  container image layers
 - the bundled PostgreSQL data volume (`postgres-data`) is the authoritative store for pairings, watches, room links, queued deliveries, and audit records — include it in your backup plan (see [Docker: Data persistence & backups](docker.md#data-persistence-backups))
+
+## Audit coverage for live write paths
+
+Every external write performed by the running service records an entry in the
+`audit_logs` table. The canonical action names live in
+`src/dischat/security/audit.py` (`LIVE_WRITE_PATHS`).
+
+| Action | Operation | Target system | Actor / context | Target identifiers recorded | Failure policy |
+| --- | --- | --- | --- | --- | --- |
+| `create_pairing_pm` | Send the pairing-code PM to a Discourse account | Discourse | Requesting Matrix user (`mxid`, `platform`) | `discourse_username_used` (PM recipient) | Failed attempts are recorded with `success = FALSE` and `error_message`; the write error is re-raised so upstream retry/logic still sees it. |
+| `create_discourse_reply` | Relay a Matrix reply into a Discourse topic | Discourse | Matrix user (`mxid`, `platform`) or relay account username | `topic_id`, `post_id` (success only), `matrix_room_id`, `matrix_event_id` | Same failed-attempt policy. |
+| `deliver_matrix_room_message` | Deliver a Discourse post into a linked Matrix room | Matrix | `system` (`mxid = "system"`, `platform = "system"`) | `topic_id`, `post_id`, `matrix_room_id`, `matrix_event_id` | Same failed-attempt policy, including `missing_discourse_event` before any send is attempted. |
+| `deliver_matrix_dm_message` | Deliver a Discourse post as a Matrix DM | Matrix | `system` + target user (`mxid`) | `topic_id`, `post_id`, `mxid` (DM recipient), `matrix_room_id`, `matrix_event_id` | Same failed-attempt policy; `missing_dm_room_id` records the send result when no room id exists. |
+| `send_matrix_notice` | Send a Matrix notice: command responses and permission/error replies | Matrix | Requesting Matrix user (`mxid`, `platform`) | `matrix_room_id`, `matrix_event_id` (success only) | Same failed-attempt policy. |
+
+Audit policy:
+
+- **Attempts are recorded before the write.** For every live write path the
+  audit row is inserted with `status = 'pending'` *before* the external API
+  call, and the row's outcome (`status = 'success'` / `'failed'`,
+  `success`, `error_message`) is updated *after* the write completes but
+  *before* any dependent local persistence such as the
+  `delivery_messages.create_mapping(...)` insert. A crash between a successful
+  external write and its mapping insert therefore still leaves an audit row
+  (resolution: `status = 'pending'` means the write was attempted and may have
+  succeeded; `status = 'success'` proves it did). Migration
+  `0006_audit_attempt_status.sql` adds the `status` column with a
+  `('pending', 'success', 'failed')` check constraint.
+- **Failed attempts are retained.** Every external write records one row per
+  attempt regardless of outcome; failures use the same action name with
+  `success = FALSE`.
+- **Failure reasons are stored without secrets.** `error_message` contains a
+  stable reason token (for example `missing_discourse_event`) or only the
+  exception class name. Arbitrary exception text is never persisted because
+  it can echo request bodies or credentials in shapes no regex can safely
+  enumerate. Pairing codes and their hashes, API keys, access tokens, and
+  message bodies never enter `audit_logs`.
+- **Coverage is enforced structurally.** Migration
+  `0005_audit_write_paths.sql` adds an `action <> ''` check constraint plus
+  `(created_at)` and `(success, created_at)` indexes for triage queries, and
+  live write paths require an audit repository at wiring time
+  (`MissingAuditLoggerError`).
+
+Not audited (not message-content writes performed by the running bridge):
+
+- local PostgreSQL bookkeeping inside dischat itself (pairing sessions,
+  delivery mappings, job queue state)
+- read-only Discourse polls (`GET` endpoints) and Matrix syncs
+- room membership operations: invite acceptance, room joins, and DM-room
+  creation. These change membership only (no message content), are idempotent
+  (repeated joins/creates are no-ops), and carry no message payload, so they
+  are outside the message-write audit guarantee above.

@@ -30,7 +30,9 @@ async def sync_categories_from_discourse(
     seen_discourse_category_ids: list[int] = []
     for raw in discourse_categories:
         discourse_category_id = int(str(raw["id"]))
-        is_public = not bool(raw.get("read_restricted", False))
+        # Missing or malformed visibility metadata is not proof of public
+        # access. Only Discourse's explicit boolean false opens the gate.
+        is_public = raw.get("read_restricted") is False
         if live_e2e_category_id is not None and discourse_category_id != live_e2e_category_id:
             continue
         seen_discourse_category_ids.append(discourse_category_id)

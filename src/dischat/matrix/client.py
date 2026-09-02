@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Any, ClassVar, Protocol
 
@@ -16,9 +17,16 @@ from nio import (
     RoomMessageText,
     RoomSendResponse,
     SyncResponse,
+    WhoamiResponse,
 )
 
 from dischat.matrix.formatting import plain_notice, plain_text, reply_message, rich_text
+
+
+def event_notice_tx_id(room_id: str, event_id: str) -> str:
+    """Return a stable Matrix transaction id for one inbound-event notice."""
+    digest = hashlib.sha256(f"{room_id}\0{event_id}\0notice".encode()).hexdigest()
+    return f"dischat-notice-{digest}"
 
 
 @dataclass(slots=True, frozen=True)
@@ -49,7 +57,9 @@ class MatrixClient(Protocol):
         tx_id: str | None = None,
     ) -> MatrixSendResult: ...
 
-    async def send_notice(self, room_id: str, body: str) -> MatrixSendResult: ...
+    async def send_notice(
+        self, room_id: str, body: str, *, tx_id: str | None = None
+    ) -> MatrixSendResult: ...
 
     async def send_reply(
         self,
@@ -93,6 +103,7 @@ class NioMatrixClient:
             device_id=device_id,
             config=AsyncClientConfig(
                 max_limit_exceeded=0,
+                max_timeouts=3,
                 request_timeout=30,
             ),
         )
@@ -119,6 +130,7 @@ class NioMatrixClient:
 
     async def login(self) -> None:
         if self._client.access_token:
+            await self._verify_device_identity()
             return
         if not self._password:
             raise ValueError("Matrix password is required when access token is missing.")
@@ -132,6 +144,20 @@ class NioMatrixClient:
         # nio re-logs in as the same device and the durable tx ids stay valid.
         if self._client.access_token is not None:
             self._access_token_cache[self._cache_key] = self._client.access_token
+        await self._verify_device_identity()
+
+    async def _verify_device_identity(self) -> None:
+        """Fail closed if the configured identity is not the token's real device."""
+        if not self._device_id:
+            raise ValueError("MATRIX_DEVICE_ID is required for restart-safe delivery.")
+        response = await self._client.whoami()
+        if not isinstance(response, WhoamiResponse):
+            raise ValueError(f"Matrix whoami failed: {response}")
+        if response.device_id != self._device_id:
+            raise ValueError(
+                "MATRIX_DEVICE_ID does not match the authenticated access token "
+                f"(configured {self._device_id!r}, actual {response.device_id!r})."
+            )
 
     async def close(self) -> None:
         await self._client.close()
@@ -164,8 +190,12 @@ class NioMatrixClient:
                 if isinstance(event, InviteMemberEvent) and event.state_key == self.user_id:
                     await self._client.join(room_id)
 
-    async def send_notice(self, room_id: str, body: str) -> MatrixSendResult:
-        response = await self._client.room_send(room_id, "m.room.message", plain_notice(body))
+    async def send_notice(
+        self, room_id: str, body: str, *, tx_id: str | None = None
+    ) -> MatrixSendResult:
+        response = await self._client.room_send(
+            room_id, "m.room.message", plain_notice(body), tx_id=tx_id
+        )
         if not isinstance(response, RoomSendResponse):
             raise ValueError(f"Matrix send_notice failed: {response}")
         return MatrixSendResult(event_id=response.event_id, room_id=room_id)

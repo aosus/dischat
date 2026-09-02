@@ -82,6 +82,42 @@ def _topic_posts(topic_payload: dict[str, object]) -> list[dict[str, object]]:
     return [cast("dict[str, object]", post) for post in posts if isinstance(post, dict)]
 
 
+async def _list_unseen_latest_posts(
+    client: DiscourseClientLike, *, last_seen_post_id: int | None
+) -> list[dict[str, object]]:
+    """Page backwards until the durable cursor is reached.
+
+    On a brand-new deployment there is deliberately no historical cursor, so
+    only the current latest page is considered. After that first successful
+    scan, every restart can backfill however many pages arrived while the
+    service was offline.
+    """
+    page = await client.list_latest_posts(before=None)
+    pages = [page]
+    if last_seen_post_id is None:
+        return page
+
+    while page:
+        oldest_id = min(int(cast("int | str", post["id"])) for post in page)
+        if oldest_id <= last_seen_post_id:
+            break
+        page = await client.list_latest_posts(before=oldest_id)
+        if page:
+            next_oldest_id = min(int(cast("int | str", post["id"])) for post in page)
+            if next_oldest_id >= oldest_id:
+                raise RuntimeError(
+                    "Discourse latest-post pagination did not advance before the cursor"
+                )
+        pages.append(page)
+
+    deduplicated: dict[int, dict[str, object]] = {}
+    for fetched_page in pages:
+        for post in fetched_page:
+            post_id = int(cast("int | str", post["id"]))
+            deduplicated[post_id] = post
+    return list(deduplicated.values())
+
+
 async def poll_once(
     *,
     client: DiscourseClientLike,
@@ -134,7 +170,7 @@ async def poll_once(
                     for topic_post in _topic_posts(topic_payload)
                 )
     else:
-        posts = await client.list_latest_posts(before=None)
+        posts = await _list_unseen_latest_posts(client, last_seen_post_id=state.last_seen_post_id)
     posts = sorted(posts, key=lambda item: int(item["id"]))
     processed = 0
     for post_payload in posts:
@@ -166,12 +202,15 @@ async def poll_once(
         if isinstance(raw_category_id, int | str):
             discourse_category_id = int(raw_category_id)
         include_non_public_category = False
-        if discourse_category_id is None and live_e2e_category_id is not None:
-            # Live-E2E mode reads a single category feed; tolerate payloads missing category_id.
-            discourse_category_id = live_e2e_category_id
         if discourse_category_id is None:
+            state.last_seen_post_id = post_id
             continue
-        if live_e2e_category_id is not None and discourse_category_id == live_e2e_category_id:
+        if live_e2e_category_id is not None:
+            # The live feed is a strict, single-category test fixture. Never
+            # route an unexpected category returned by that endpoint.
+            if discourse_category_id != live_e2e_category_id:
+                state.last_seen_post_id = post_id
+                continue
             include_non_public_category = True
         else:
             category_record = await categories.get_by_discourse_category_id(discourse_category_id)
@@ -180,6 +219,11 @@ async def poll_once(
                 or not category_record.enabled
                 or not category_record.is_public
             ):
+                # A successfully revalidated snapshot proves this post is not
+                # eligible. Advance the scan cursor so content that was private
+                # when observed cannot be retroactively leaked if its category
+                # becomes public later.
+                state.last_seen_post_id = post_id
                 continue
         discourse_event: DiscourseEvent = normalize_post_event(post_payload)
         if discourse_event.reply_to_post_number is not None:

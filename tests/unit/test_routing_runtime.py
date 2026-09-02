@@ -4,10 +4,10 @@ from typing import Any
 from dischat.bridge import handle_matrix_reply
 from dischat.discourse.models import DiscourseEvent
 from dischat.discourse.router import route_event
-from dischat.discourse.sync import PollerState, poll_once
+from dischat.discourse.sync import PollerState, _list_unseen_latest_posts, poll_once
 from dischat.jobs.workers import deliver_job
 from dischat.matrix.client import MatrixMessage, MatrixSendResult
-from dischat.security.audit import AuditEntry
+from dischat.security.audit import STATUS_FAILED, STATUS_SUCCESS, AuditEntry
 from dischat.storage.repositories import (
     ChatAccount,
     DeliveryJobRecord,
@@ -57,13 +57,39 @@ class FakeDiscourseClient:
         return FakeDiscourseWriteResult(post_id=99, topic_id=topic_id, raw=raw)
 
     async def list_latest_posts(self, *, before: int | None = None) -> list[dict[str, object]]:
-        return self.latest_posts
+        if before is None:
+            return self.latest_posts
+        return [post for post in self.latest_posts if int(str(post["id"])) < before]
 
     async def get_topic(self, topic_id: int) -> dict[str, object]:
         return self.topics[topic_id]
 
     async def get_post(self, post_id: int) -> dict[str, object]:
         return self.posts[post_id]
+
+
+async def test_latest_posts_backfill_pages_until_durable_cursor() -> None:
+    class PagedClient:
+        def __init__(self) -> None:
+            self.calls: list[int | None] = []
+
+        async def list_latest_posts(self, *, before: int | None = None) -> list[dict[str, object]]:
+            self.calls.append(before)
+            pages: dict[int | None, list[dict[str, object]]] = {
+                None: [{"id": 36}, {"id": 35}],
+                35: [{"id": 34}, {"id": 33}],
+                33: [{"id": 32}, {"id": 31}],
+            }
+            return pages.get(before, [])
+
+        async def get_topic(self, topic_id: int) -> dict[str, object]:
+            raise AssertionError("not used")
+
+    client = PagedClient()
+    posts = await _list_unseen_latest_posts(client, last_seen_post_id=31)
+
+    assert client.calls == [None, 35, 33]
+    assert sorted(int(str(post["id"])) for post in posts) == [31, 32, 33, 34, 35, 36]
 
 
 class FakeMatrixClient:
@@ -89,7 +115,9 @@ class FakeMatrixClient:
         self.texts.append((room_id, body, formatted))
         return MatrixSendResult(event_id="$text", room_id=room_id)
 
-    async def send_notice(self, room_id: str, body: str) -> MatrixSendResult:
+    async def send_notice(
+        self, room_id: str, body: str, *, tx_id: str | None = None
+    ) -> MatrixSendResult:
         self.notices.append((room_id, body))
         return MatrixSendResult(event_id="$notice", room_id=room_id)
 
@@ -157,6 +185,7 @@ class FakeRoomLinks:
     def __init__(self, room_link: RoomLinkRecord | None = None) -> None:
         self.room_link = room_link
         self.by_category: dict[str, list[RoomLinkRecord]] = {}
+        self.all_public: list[RoomLinkRecord] = []
         self.by_room: dict[str, RoomLinkRecord] = {}
         self.matching_calls: list[dict[str, object]] = []
         if room_link is not None:
@@ -166,12 +195,19 @@ class FakeRoomLinks:
         return self.by_room.get(matrix_room_id, self.room_link)
 
     async def list_links_matching_category(
-        self, category_slug: str, *, include_non_public: bool = False
+        self,
+        category_slug: str,
+        *,
+        category_id: int | None = None,
+        include_non_public: bool = False,
     ) -> list[RoomLinkRecord]:
         self.matching_calls.append(
             {"category_slug": category_slug, "include_non_public": include_non_public}
         )
-        return self.by_category.get(category_slug, [])
+        matches = list(self.by_category.get(category_slug, []))
+        if not include_non_public:
+            matches.extend(self.all_public)
+        return matches
 
 
 class FakeDeliveryMessages:
@@ -237,14 +273,45 @@ class FakeDeliveryMessages:
 class FakeAuditLogs:
     def __init__(self) -> None:
         self.entries: list[AuditEntry] = []
+        self._next_id = 1
 
-    async def record(self, entry: AuditEntry) -> None:
+    async def record(self, entry: AuditEntry) -> int:
+        entry_id = self._next_id
+        self._next_id += 1
         self.entries.append(entry)
+        return entry_id
+
+    async def update_outcome(
+        self,
+        audit_log_id: int,
+        *,
+        success: bool,
+        error_message: str | None,
+        post_id: int | None = None,
+        matrix_event_id: str | None = None,
+        matrix_room_id: str | None = None,
+    ) -> None:
+        old = self.entries[audit_log_id - 1]
+        self.entries[audit_log_id - 1] = AuditEntry(
+            action=old.action,
+            discourse_username_used=old.discourse_username_used,
+            mxid=old.mxid,
+            platform=old.platform,
+            discourse_user_id_used=old.discourse_user_id_used,
+            topic_id=old.topic_id,
+            post_id=post_id,
+            matrix_room_id=matrix_room_id or old.matrix_room_id,
+            matrix_event_id=matrix_event_id or old.matrix_event_id,
+            success=success,
+            error_message=error_message,
+            status=STATUS_SUCCESS if success else STATUS_FAILED,
+        )
 
 
 class FakeUserWatches:
     def __init__(self) -> None:
         self.mxids_by_category: dict[int, list[str]] = {}
+        self.all_public: list[str] = []
         self.watch_calls: list[dict[str, object]] = []
 
     async def list_mxids_for_category(
@@ -253,12 +320,16 @@ class FakeUserWatches:
         self.watch_calls.append(
             {"category_id": category_id, "include_non_public": include_non_public}
         )
-        return self.mxids_by_category.get(category_id, [])
+        matches = list(self.mxids_by_category.get(category_id, []))
+        if not include_non_public:
+            matches.extend(self.all_public)
+        return matches
 
 
 class FakeDeliveryJobs:
     def __init__(self) -> None:
         self.enqueued: list[dict[str, object]] = []
+        self.parent_rooms_by_post: dict[int, list[str]] = {}
 
     async def enqueue(
         self,
@@ -276,6 +347,9 @@ class FakeDeliveryJobs:
                 "matrix_room_id": matrix_room_id,
             }
         )
+
+    async def list_room_ids_for_discourse_post(self, *, discourse_post_id: int) -> list[str]:
+        return self.parent_rooms_by_post.get(discourse_post_id, [])
 
 
 class FakeCategories:
@@ -616,6 +690,7 @@ async def test_deliver_job_uses_excerpt_and_thread_reply_for_room_jobs() -> None
         chat_accounts=FakeChatAccounts(),
         room_links=room_links,
         matrix_client=matrix,
+        audit_logs=FakeAuditLogs(),
     )
 
     assert result.complete is True
@@ -675,6 +750,7 @@ async def test_deliver_job_formats_new_topic_with_title_for_room_jobs() -> None:
         chat_accounts=FakeChatAccounts(),
         room_links=room_links,
         matrix_client=matrix,
+        audit_logs=FakeAuditLogs(),
     )
 
     assert result.complete is True
@@ -1061,10 +1137,10 @@ async def test_live_e2e_bypass_never_fans_private_category_out_to_all_public_wat
         enabled=True,
         category_slugs=(),
     )
-    room_links.by_category["all"] = [all_public_room]
+    room_links.all_public = [all_public_room]
     # And no explicit category watch — only an all_public_categories watch.
     watches = FakeUserWatches()
-    watches.mxids_by_category[999] = ["@all:aosus.org"]
+    watches.all_public = ["@all:aosus.org"]
 
     discourse_events = FakeDiscourseEvents()
     jobs = FakeDeliveryJobs()
@@ -1117,6 +1193,41 @@ async def test_route_event_defaults_never_reactivate_non_public_matching() -> No
     )
 
     assert jobs.enqueued == []
+
+
+async def test_same_poll_reply_inherits_parent_pending_room_job() -> None:
+    jobs = FakeDeliveryJobs()
+    jobs.parent_rooms_by_post[100] = ["!room:test"]
+
+    await route_event(
+        event_id=2,
+        discourse_event=DiscourseEvent(
+            discourse_topic_id=20,
+            discourse_post_id=101,
+            reply_to_post_number=2,
+            event_type="bridged_thread_reply",
+            category_id=99,
+            author_username="bob",
+            target_discourse_username=None,
+            raw_payload_json={"reply_to_discourse_post_id": 100},
+        ),
+        category_slug="support",
+        category_id=1,
+        room_links=FakeRoomLinks(),
+        chat_accounts=FakeChatAccounts(),
+        user_watches=FakeUserWatches(),
+        delivery_messages=FakeDeliveryMessages(),
+        delivery_jobs=jobs,
+    )
+
+    assert jobs.enqueued == [
+        {
+            "event_id": 2,
+            "target_type": "room",
+            "target_mxid": None,
+            "matrix_room_id": "!room:test",
+        }
+    ]
 
 
 async def test_non_public_category_gets_no_exception_outside_live_e2e_mode() -> None:

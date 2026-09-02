@@ -21,4 +21,23 @@ jobs:
       - run: uv run ty check
       - run: uv run pytest --cov=src --cov-report=term-missing
       - run: uv run mkdocs build --strict
+      - run: uv build
+      - name: Verify wheel contains SQL migrations
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheel = next(Path("dist").glob("*.whl"))
+          with ZipFile(wheel) as archive:
+              names = set(archive.namelist())
+          migration_dir = Path("src/dischat/storage/migrations")
+          required = {
+              f"dischat/storage/migrations/{path.name}"
+              for path in migration_dir.glob("*.sql")
+          }
+          missing = required - names
+          if missing:
+              raise SystemExit(f"wheel is missing migrations: {sorted(missing)}")
+          PY
       - run: docker build -t dischat:ci .

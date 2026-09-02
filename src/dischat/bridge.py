@@ -6,8 +6,16 @@ from typing import Any, Protocol, cast
 import httpx
 
 from dischat.i18n import translate
-from dischat.matrix.client import MatrixMessage, MatrixSendResult
-from dischat.security.audit import AuditEntry
+from dischat.matrix.client import MatrixMessage, MatrixSendResult, event_notice_tx_id
+from dischat.security.audit import (
+    ACTION_DISCOURSE_REPLY,
+    ACTION_SEND_MATRIX_NOTICE,
+    STATUS_PENDING,
+    AuditEntry,
+    failure_reason,
+    record_audit_attempt,
+    update_audit_outcome,
+)
 from dischat.security.permissions import can_post_from_chat, detect_platform
 from dischat.storage.repositories import (
     ChatAccount,
@@ -82,7 +90,18 @@ class DeliveryMessagesRepo(Protocol):
 
 
 class AuditLogsRepo(Protocol):
-    async def record(self, entry: AuditEntry) -> None: ...
+    async def record(self, entry: AuditEntry) -> int | None: ...
+
+    async def update_outcome(
+        self,
+        audit_log_id: int,
+        *,
+        success: bool,
+        error_message: str | None,
+        post_id: int | None = None,
+        matrix_event_id: str | None = None,
+        matrix_room_id: str | None = None,
+    ) -> None: ...
 
 
 class MatrixEventMarker(Protocol):
@@ -120,6 +139,10 @@ class MatrixEventStateRepo(Protocol):
         lease_seconds: int = ...,
     ) -> MatrixEventMarker | None: ...
 
+    async def begin_event_write(
+        self, *, matrix_room_id: str, matrix_event_id: str, lease_owner: str
+    ) -> bool: ...
+
     async def mark_event_written(
         self,
         *,
@@ -147,9 +170,15 @@ class MatrixEventStateRepo(Protocol):
         self, *, matrix_room_id: str, matrix_event_id: str, lease_owner: str | None = None
     ) -> None: ...
 
+    async def reconcile_event_from_mapping(
+        self, *, matrix_room_id: str, matrix_event_id: str
+    ) -> None: ...
+
 
 class MatrixNoticeClient(Protocol):
-    async def send_notice(self, room_id: str, body: str) -> MatrixSendResult: ...
+    async def send_notice(
+        self, room_id: str, body: str, *, tx_id: str | None = None
+    ) -> MatrixSendResult: ...
 
 
 def _bridge_result_for_existing_reply(mapping: DeliveryMessageRecord | None) -> BridgeResult:
@@ -198,6 +227,7 @@ async def _reconcile_written_event(
         matrix_event_id=event_id,
     )
     if mapping is not None:
+        await event_state.mark_event_processed(matrix_room_id=room_id, matrix_event_id=event_id)
         return BridgeResult(posted=False, discourse_post_id=mapping.discourse_post_id)
 
     event = await event_state.get_event(matrix_room_id=room_id, matrix_event_id=event_id)
@@ -233,6 +263,47 @@ def relay_username_for_platform(*, platform: str, matrix: str, telegram: str, di
     return matrix
 
 
+async def _send_notice_with_audit(
+    *,
+    matrix_client: MatrixNoticeClient,
+    audit_logs: AuditLogsRepo,
+    room_id: str,
+    body: str,
+    mxid: str,
+    platform: str,
+    tx_id: str | None = None,
+) -> MatrixSendResult:
+    """Send a Matrix notice as an audited live write (attempt-first)."""
+    attempt_id = await record_audit_attempt(
+        audit_logs,
+        AuditEntry(
+            action=ACTION_SEND_MATRIX_NOTICE,
+            discourse_username_used="",
+            mxid=mxid,
+            platform=platform,
+            matrix_room_id=room_id,
+            success=None,
+            status=STATUS_PENDING,
+        ),
+        require_logger=True,
+    )
+    try:
+        result = await matrix_client.send_notice(room_id, body, tx_id=tx_id)
+    except Exception as exc:
+        await update_audit_outcome(
+            audit_logs, attempt_id, success=False, error_message=failure_reason(exc)
+        )
+        raise
+    await update_audit_outcome(
+        audit_logs,
+        attempt_id,
+        success=True,
+        error_message=None,
+        matrix_event_id=result.event_id,
+    )
+    return result
+
+
 async def handle_matrix_reply(
     *,
     message: MatrixMessage,
@@ -241,7 +312,7 @@ async def handle_matrix_reply(
     chat_accounts: ChatAccountsRepo,
     room_links: RoomLinksRepo,
     delivery_messages: DeliveryMessagesRepo,
-    audit_logs: AuditLogsRepo,
+    audit_logs: Any,
     event_state: MatrixEventStateRepo | None = None,
     relay_matrix_username: str,
     relay_telegram_username: str,
@@ -249,6 +320,24 @@ async def handle_matrix_reply(
 ) -> BridgeResult:
     if message.parent_event_id is None:
         return BridgeResult(posted=False)
+
+    # A delivery mapping is stronger evidence than the replay ledger: it
+    # proves this exact Matrix event already produced a Discourse post. Check
+    # it before inserting a fresh fence so retention or an operator cleanup
+    # can never reopen a duplicate-write path.
+    existing_reply_mapping = await delivery_messages.get_by_matrix_event(
+        matrix_room_id=message.room_id,
+        matrix_event_id=message.event_id,
+    )
+    if existing_reply_mapping is not None:
+        if event_state is not None:
+            reconcile = getattr(event_state, "reconcile_event_from_mapping", None)
+            if reconcile is not None:
+                await reconcile(
+                    matrix_room_id=message.room_id,
+                    matrix_event_id=message.event_id,
+                )
+        return _bridge_result_for_existing_reply(existing_reply_mapping)
 
     # Durable idempotency fence: seed the marker and take an exclusive
     # processing lease BEFORE any Discourse write. The lease owner token is
@@ -277,23 +366,15 @@ async def handle_matrix_reply(
             #     outcome; never write twice;
             #   - no marker at all (deleted between the failed claim and this
             #     read) → re-claim and deliver as a fresh attempt.
-            existing_mapping = await delivery_messages.get_by_matrix_event(
-                matrix_room_id=message.room_id,
-                matrix_event_id=message.event_id,
-            )
-            if existing_mapping is not None:
-                return _bridge_result_for_existing_reply(existing_mapping)
             event = await event_state.get_event(
                 matrix_room_id=message.room_id, matrix_event_id=message.event_id
             )
-            if event is not None and event.status in ("claimed", "owned"):
-                # Exclusive takeover: the row transitions to the distinct
-                # 'owned' state under this attempt's lease token, so exactly
-                # one racing attempt can win. The repository only releases a
-                # fence whose lease has demonstrably lapsed (a crashed
-                # predecessor — before or after adoption), never one a live
-                # worker still holds; 'written'/'processed' markers are never
-                # adopted.
+            if event is not None and event.status == "claimed":
+                # Exclusive takeover: the stale claim receives this attempt's
+                # fresh lease token, so exactly one racing replay can win. It
+                # stays claimed until begin_event_write enters the terminal
+                # ambiguous-write state; owned/written/processed markers are
+                # never adopted.
                 adopted = await event_state.adopt_event(
                     matrix_room_id=message.room_id,
                     matrix_event_id=message.event_id,
@@ -305,7 +386,7 @@ async def handle_matrix_reply(
                     # the takeover. It owns the event's side effects now.
                     return BridgeResult(posted=False, error_message="event_already_claimed")
                 # Fence taken over: fall through and deliver the event.
-            elif event is not None:
+            elif event is not None and event.status in ("written", "processed"):
                 # 'written'/'processed': the external write already happened
                 # and its outcome is recorded. Reconcile the mapping from the
                 # recorded outcome; never write to Discourse again.
@@ -315,6 +396,8 @@ async def handle_matrix_reply(
                     room_id=message.room_id,
                     event_id=message.event_id,
                 )
+            elif event is not None and event.status == "owned":
+                return BridgeResult(posted=False, error_message="event_write_ambiguous")
             else:
                 # No marker (e.g. deleted between the failed claim and this
                 # read). Re-seed the fence: reconcile would wrongly confirm
@@ -340,7 +423,7 @@ async def handle_matrix_reply(
         await _release_event_fence(
             event_state, room_id=message.room_id, event_id=message.event_id, lease_owner=lease_owner
         )
-        return BridgeResult(posted=False)
+        return BridgeResult(posted=False, error_message="parent_mapping_pending")
 
     account = await chat_accounts.ensure_account(
         mxid=message.sender,
@@ -356,9 +439,14 @@ async def handle_matrix_reply(
     )
 
     if permission.decision == "reject":
-        response = await matrix_client.send_notice(
-            message.room_id,
-            translate("posting.requires_pairing", account.response_locale),
+        response = await _send_notice_with_audit(
+            matrix_client=matrix_client,
+            audit_logs=audit_logs,
+            room_id=message.room_id,
+            body=translate("posting.requires_pairing", account.response_locale),
+            mxid=message.sender,
+            platform=account.platform,
+            tx_id=event_notice_tx_id(message.room_id, message.event_id),
         )
         await _release_event_fence(
             event_state, room_id=message.room_id, event_id=message.event_id, lease_owner=lease_owner
@@ -401,9 +489,14 @@ async def handle_matrix_reply(
                     reply_to_post_number = topic_post.get("post_number")
                     break
     if not isinstance(reply_to_post_number, int):
-        response = await matrix_client.send_notice(
-            message.room_id,
-            translate("posting.requires_pairing", account.response_locale),
+        response = await _send_notice_with_audit(
+            matrix_client=matrix_client,
+            audit_logs=audit_logs,
+            room_id=message.room_id,
+            body=translate("posting.requires_pairing", account.response_locale),
+            mxid=message.sender,
+            platform=account.platform,
+            tx_id=event_notice_tx_id(message.room_id, message.event_id),
         )
         await _release_event_fence(
             event_state, room_id=message.room_id, event_id=message.event_id, lease_owner=lease_owner
@@ -425,14 +518,40 @@ async def handle_matrix_reply(
     #     with the outcome; a replay rebuilds the mapping instead of writing
     #     a duplicate Discourse post.
     #
-    # external_write_done flips only after create_reply() returns. A failure
-    # before that point leaves the fence provably write-free and it is
-    # released for a clean retry; a failure after it (the outcome-recording
-    # or mapping writes) must NOT release the fence — the Discourse write
-    # already happened, and if the outcome itself could not be recorded the
-    # documented residual at-least-once window (docs/operations.md) applies
-    # instead of a guaranteed duplicate.
+    # external_write_done flips only after create_reply() returns. The marker
+    # enters owned immediately before that call; any transport failure is
+    # ambiguous and remains fenced for operator reconciliation. Failures after
+    # the call returns also preserve the written/owned fence.
     external_write_done = False
+    reply_audit_id = await record_audit_attempt(
+        audit_logs,
+        AuditEntry(
+            action=ACTION_DISCOURSE_REPLY,
+            mxid=message.sender,
+            platform=account.platform,
+            discourse_username_used=discourse_username or "",
+            topic_id=parent.discourse_topic_id,
+            matrix_room_id=message.room_id,
+            matrix_event_id=message.event_id,
+            success=None,
+            status=STATUS_PENDING,
+        ),
+        require_logger=True,
+    )
+    if event_state is not None and lease_owner is not None:
+        begin_write = getattr(event_state, "begin_event_write", None)
+        if begin_write is None or not await begin_write(
+            matrix_room_id=message.room_id,
+            matrix_event_id=message.event_id,
+            lease_owner=lease_owner,
+        ):
+            await update_audit_outcome(
+                audit_logs,
+                reply_audit_id,
+                success=False,
+                error_message="event_fence_lost_before_write",
+            )
+            return BridgeResult(posted=False, error_message="event_already_claimed")
     try:
         write_result = await discourse_client.create_reply(
             topic_id=parent.discourse_topic_id,
@@ -460,6 +579,17 @@ async def handle_matrix_reply(
                     error_message="event_already_claimed",
                     discourse_post_id=outcome.conflicting_post_id,
                 )
+        # Resolve the audit attempt after the durable event outcome. If this
+        # local update fails, the event fence still prevents a duplicate
+        # Discourse write and the pending audit row truthfully signals an
+        # outcome that needs reconciliation.
+        await update_audit_outcome(
+            audit_logs,
+            reply_audit_id,
+            success=True,
+            error_message=None,
+            post_id=write_result.post_id,
+        )
         await delivery_messages.create_mapping(
             discourse_topic_id=write_result.topic_id,
             discourse_post_id=write_result.post_id,
@@ -469,21 +599,16 @@ async def handle_matrix_reply(
             target_mxid=None,
             parent_delivery_message_id=parent.id,
         )
-    except Exception:
-        if event_state is None or external_write_done:
-            # Either no fence is managed here, or the external write already
-            # completed: the marker is 'written' (release_event cannot delete
-            # it) or, if recording the outcome itself failed, the fence stays
-            # standing under this attempt's lapsed lease and the documented
-            # residual at-least-once window applies. Releasing in this state
-            # would invite a guaranteed duplicate write on replay.
-            raise
-        # create_reply itself failed: no external write happened in this
-        # attempt, so release the fence (only while still holding the lease)
-        # so a later delivery retries cleanly.
-        await _release_event_fence(
-            event_state, room_id=message.room_id, event_id=message.event_id, lease_owner=lease_owner
-        )
+    except Exception as exc:
+        if event_state is None and not external_write_done:
+            # Compatibility for unfenced test/adapter paths: without a
+            # durable marker there is no reconciliation state to preserve.
+            await update_audit_outcome(
+                audit_logs, reply_audit_id, success=False, error_message=failure_reason(exc)
+            )
+        # Transport failures after entering ``owned`` are ambiguous: the
+        # server may have committed the reply before the connection failed.
+        # Leave both the fence and audit attempt pending for reconciliation.
         raise
 
     if event_state is not None:
@@ -495,19 +620,6 @@ async def handle_matrix_reply(
             matrix_room_id=message.room_id,
             matrix_event_id=message.event_id,
         )
-    await audit_logs.record(
-        AuditEntry(
-            action="create_discourse_reply",
-            mxid=message.sender,
-            platform=account.platform,
-            discourse_username_used=discourse_username,
-            topic_id=write_result.topic_id,
-            post_id=write_result.post_id,
-            matrix_room_id=message.room_id,
-            matrix_event_id=message.event_id,
-            success=True,
-        )
-    )
     return BridgeResult(
         posted=True,
         discourse_username=discourse_username,

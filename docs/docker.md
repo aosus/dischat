@@ -3,6 +3,9 @@
 The repository includes a production `Dockerfile`, a standard `docker-compose.yml`, and a live-test `docker-compose.live-e2e.yml`.
 
 Use `docker compose up --build -d` for local service startup. The container runs the long-lived bridge process rather than a one-shot bootstrap command.
+Compose requires a regular-file `config.yaml` next to `docker-compose.yml`; copy
+`config.example.yaml` before the first startup. The bind mount deliberately
+refuses to create a directory when that file is missing.
 
 The regular test suite also uses Docker for PostgreSQL integration tests through Testcontainers.
 
@@ -20,34 +23,60 @@ Choose an **external PostgreSQL instance** when you already operate one, need ma
 2. Start the bridge without its Compose dependencies:
 
    ```bash
-   docker compose up -d --no-deps dischat
+   POSTGRES_ADMIN_PASSWORD=external-admin-unused \
+   POSTGRES_PASSWORD=external-runtime-unused \
+     docker compose up -d --no-deps dischat
    ```
 
-   `dischat` declares `depends_on` for the bundled `postgres` service, so without `--no-deps`, Compose would start the bundled database too. With `--no-deps`, only the bridge starts; no other change is required.
+   `dischat` declares `depends_on` for the bundled `postgres` service, so without
+   `--no-deps`, Compose would start the bundled database too. Compose interpolates
+   the full file before selecting services, so its required bundled-database
+   passwords must still receive nonempty, unused placeholders as shown above.
 
-## Development vs production database credentials
+## Database roles and credentials
 
-The example user/password pair `dischat/dischat` in `docker-compose.yml` is **for local development only**.
+The bundled database creates two roles on the first initialization:
 
-For production, set a strong password before the first startup (the password is baked into the data directory on initial volume creation):
+- `dischat_admin`, the PostgreSQL image's bootstrap administrator;
+- `dischat`, a separate `NOSUPERUSER`, `NOCREATEDB`, `NOCREATEROLE` runtime
+  role that owns only the `dischat` database/schema and runs application
+  migrations.
+
+Set different strong passwords for both roles before first startup (they are
+written into the data directory when the volume is initialized):
 
 ```bash
 # .env next to docker-compose.yml
-POSTGRES_PASSWORD=<long-random-password>
+POSTGRES_ADMIN_PASSWORD=<long-random-admin-password>
+POSTGRES_PASSWORD=<different-long-random-runtime-password>
 ```
 
 and make sure `DATABASE_URL` inside the app's `.env` file matches it:
 
 ```text
-DATABASE_URL=postgresql://dischat:<same-password>@postgres:5432/dischat
+DATABASE_URL=postgresql://dischat:<runtime-password>@postgres:5432/dischat
 ```
 
 > [!NOTE]
 > `DATABASE_URL` is parsed as a URI by asyncpg. Percent-encode URI-reserved characters (`@ : / # ? & = %`) in both the username and the password — e.g. Python's `urllib.parse.quote(password, safe="")` — or restrict yourself to URL-safe characters (letters, digits, `-`, `_`).
 
-The password necessarily stays in `.env` even in production: the bundled `postgres` service reads it from the `POSTGRES_PASSWORD` environment variable, and the app reads the same secret inside `DATABASE_URL`, which has no file-based form. Compose interpolates each file *before* merging overrides, so the required `POSTGRES_PASSWORD` in `docker-compose.yml` cannot be swapped for the postgres image's `POSTGRES_PASSWORD_FILE` mechanism via an override file — the override fails interpolation with a "required variable POSTGRES_PASSWORD is missing a value" error unless the variable is set in the environment anyway, which defeats the purpose. For stronger secret hygiene, keep the value out of the repository (`.env` is git-ignored) and restrict file permissions on production hosts (`chmod 600 .env`).
+Both passwords stay in `.env` for the bundled deployment. Keep that file out
+of the repository and restrict it with `chmod 600 .env`. `.dockerignore`
+explicitly excludes `.env*` and runtime `config*.yaml` files so credentials
+and room mappings cannot enter image layers; Compose mounts `config.yaml`
+read-only at runtime.
 
-Rotating the password later requires changing it inside PostgreSQL (`ALTER USER ... WITH PASSWORD`) plus updating `POSTGRES_PASSWORD` and `DATABASE_URL` in `.env`, since environment variables only apply on first initialization of the data directory.
+The one-shot `db-bootstrap` service verifies the role split and applies the
+runtime-role password on every startup, including existing volumes. For a
+volume created by the older single-role Compose setup, set
+`POSTGRES_LEGACY_PASSWORD` to that role's previous password for the first
+upgraded startup if it differs from the new `POSTGRES_PASSWORD`; remove it
+after `db-bootstrap` succeeds.
+
+The application image includes a heartbeat healthcheck. A stale heartbeat
+marks the container unhealthy after five minutes; monitor that status in
+production. Matrix network timeout retries are bounded, so persistent Matrix
+failures terminate the process and `restart: unless-stopped` can recover it.
 
 ## Data persistence & backups
 

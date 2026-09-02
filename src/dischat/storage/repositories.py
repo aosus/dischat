@@ -8,7 +8,12 @@ from typing import Any, Literal
 
 import asyncpg
 
-from dischat.security.audit import AuditEntry
+from dischat.security.audit import (
+    STATUS_FAILED,
+    STATUS_PENDING,
+    STATUS_SUCCESS,
+    AuditEntry,
+)
 
 WatchMode = Literal["category", "all_public_categories"]
 JobStatus = Literal["pending", "running", "complete", "failed"]
@@ -968,7 +973,11 @@ class RoomLinkRepository:
         )
 
     async def list_links_matching_category(
-        self, category_slug: str, *, include_non_public: bool = False
+        self,
+        category_slug: str,
+        *,
+        category_id: int | None = None,
+        include_non_public: bool = False,
     ) -> list[RoomLinkRecord]:
         async with self._pool.acquire() as connection:
             rows = await connection.fetch(
@@ -990,7 +999,8 @@ class RoomLinkRepository:
                           rl.include_all_public_categories = TRUE
                           AND EXISTS (
                               SELECT 1 FROM categories tc
-                              WHERE tc.slug = $1
+                              WHERE (($3::bigint IS NOT NULL AND tc.id = $3) OR
+                                     ($3::bigint IS NULL AND tc.slug = $1))
                                 -- include_all_public_categories rooms must never be
                                 -- unlocked by include_non_public: the live-E2E escape
                                 -- hatch authorizes only the explicitly configured
@@ -999,12 +1009,14 @@ class RoomLinkRepository:
                                 AND tc.is_public = TRUE AND tc.enabled = TRUE
                           )
                         )
-                        OR c.slug = $1
+                        OR (($3::bigint IS NOT NULL AND c.id = $3) OR
+                            ($3::bigint IS NULL AND c.slug = $1))
                   )
                 ORDER BY rl.id, c.slug
                 """,
                 category_slug,
                 include_non_public,
+                category_id,
             )
         grouped: dict[int, RoomLinkRecord] = {}
         category_map: dict[int, list[str]] = {}
@@ -1151,6 +1163,23 @@ class DeliveryJobRepository:
                 )
         assert row is not None
         return _record_to_delivery_job(row)
+
+    async def list_room_ids_for_discourse_post(self, *, discourse_post_id: int) -> list[str]:
+        """Return rooms targeted by the parent post's existing delivery jobs."""
+        async with self._pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT DISTINCT dj.matrix_room_id
+                FROM delivery_jobs dj
+                JOIN discourse_events de ON de.id = dj.event_id
+                WHERE de.discourse_post_id = $1
+                  AND dj.target_type = 'room'
+                  AND dj.matrix_room_id IS NOT NULL
+                ORDER BY dj.matrix_room_id
+                """,
+                discourse_post_id,
+            )
+        return [str(row["matrix_room_id"]) for row in rows]
 
     async def claim_next_job(
         self, *, lease_seconds: int = DEFAULT_JOB_LEASE_SECONDS
@@ -1461,9 +1490,16 @@ class AuditLogRepository:
     def __init__(self, pool: asyncpg.Pool) -> None:
         self._pool = pool
 
-    async def record(self, entry: AuditEntry) -> None:
+    async def record(self, entry: AuditEntry) -> int | None:
+        status = entry.status
+        if entry.success is False:
+            status = STATUS_FAILED
+        elif entry.success is True:
+            status = STATUS_SUCCESS
+        elif entry.success is None:
+            status = STATUS_PENDING
         async with self._pool.acquire() as connection:
-            await connection.execute(
+            row = await connection.fetchrow(
                 """
                 INSERT INTO audit_logs (
                     action,
@@ -1477,9 +1513,11 @@ class AuditLogRepository:
                     matrix_event_id,
                     success,
                     error_message,
+                    status,
                     created_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                RETURNING id
                 """,
                 entry.action,
                 entry.mxid,
@@ -1492,8 +1530,46 @@ class AuditLogRepository:
                 entry.matrix_event_id,
                 entry.success,
                 entry.error_message,
+                status,
                 datetime.now(UTC),
             )
+        if row is None:
+            return None
+        return int(row["id"])
+
+    async def update_outcome(
+        self,
+        audit_log_id: int,
+        *,
+        success: bool,
+        error_message: str | None,
+        post_id: int | None = None,
+        matrix_event_id: str | None = None,
+        matrix_room_id: str | None = None,
+    ) -> None:
+        async with self._pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                UPDATE audit_logs
+                SET success = $2,
+                    error_message = $3,
+                    status = $4,
+                    post_id = COALESCE($5, post_id),
+                    matrix_event_id = COALESCE($6, matrix_event_id),
+                    matrix_room_id = COALESCE($7, matrix_room_id)
+                WHERE id = $1 AND status = 'pending'
+                RETURNING id
+                """,
+                audit_log_id,
+                success,
+                error_message,
+                STATUS_SUCCESS if success else STATUS_FAILED,
+                post_id,
+                matrix_event_id,
+                matrix_room_id,
+            )
+        if row is None:
+            raise RuntimeError("audit outcome row is missing or already resolved")
 
 
 class MatrixStateRepository:
@@ -1519,6 +1595,33 @@ class MatrixStateRepository:
                 DO UPDATE SET next_batch = EXCLUDED.next_batch, updated_at = NOW()
                 """,
                 next_batch,
+            )
+
+    async def get_discourse_last_seen_post_id(self) -> int | None:
+        """Return the durable high-water mark for the Discourse post feed."""
+        async with self._pool.acquire() as connection:
+            row = await connection.fetchrow(
+                "SELECT last_seen_post_id FROM discourse_poll_state WHERE singleton = TRUE"
+            )
+        if row is None or row["last_seen_post_id"] is None:
+            return None
+        return int(row["last_seen_post_id"])
+
+    async def set_discourse_last_seen_post_id(self, post_id: int) -> None:
+        """Advance the durable Discourse cursor without ever moving it backwards."""
+        async with self._pool.acquire() as connection:
+            await connection.execute(
+                """
+                INSERT INTO discourse_poll_state (singleton, last_seen_post_id, updated_at)
+                VALUES (TRUE, $1, NOW())
+                ON CONFLICT (singleton) DO UPDATE SET
+                    last_seen_post_id = GREATEST(
+                        COALESCE(discourse_poll_state.last_seen_post_id, 0),
+                        EXCLUDED.last_seen_post_id
+                    ),
+                    updated_at = NOW()
+                """,
+                post_id,
             )
 
     async def claim_event(
@@ -1582,19 +1685,18 @@ class MatrixStateRepository:
     ) -> MatrixEventStateRecord | None:
         """Atomically take exclusive ownership of an orphaned marker.
 
-        Exactly one concurrent caller can win this transition: the row moves
-        from ``claimed``/``owned`` to the ``owned`` state under the caller's
-        ``lease_owner`` token, so a loser gets ``None`` back and must not
-        perform the external write. Takeover only succeeds when the fence is
+        Exactly one concurrent caller can win this transition: the stale
+        ``claimed`` row receives the caller's fresh ``lease_owner`` token, so
+        a loser gets ``None`` back and must not perform the external write.
+        It remains ``claimed`` until ``begin_event_write`` enters the
+        non-replayable ``owned`` state. Takeover only succeeds when the fence is
         demonstrably stale — either the previous owner never held a lease (a
         pre-lease marker) or its lease has already lapsed — so a live worker
-        is never dispossessed. A fence that lapsed *before* adoption (status
-        ``claimed``) and one that lapsed *after* adoption but before any
-        external write (status ``owned``, e.g. the process died between the
-        write call returning and ``mark_event_written``) are both recoverable;
-        ``written``/``processed`` markers are not.
+        is never dispossessed. Only ``claimed`` is recoverable; ``owned`` may
+        already represent an unrecorded external write and is deliberately
+        terminal for automatic takeover, as are ``written``/``processed``.
 
-        Returns the owned record when this caller now holds the fence;
+        Returns the freshly leased claimed record when this caller now holds the fence;
         ``None`` otherwise (another attempt owns it, or an outcome was
         already recorded as ``written``/``processed``).
         """
@@ -1604,12 +1706,11 @@ class MatrixStateRepository:
             row = await connection.fetchrow(
                 """
                 UPDATE matrix_event_state
-                SET status = 'owned',
-                    lease_owner = $3,
+                SET lease_owner = $3,
                     lease_expires_at = NOW() + make_interval(secs => $4::double precision),
                     updated_at = NOW()
                 WHERE room_id = $1 AND event_id = $2
-                  AND status IN ('claimed', 'owned')
+                  AND status = 'claimed'
                   AND (
                       lease_expires_at IS NULL
                       OR lease_expires_at <= NOW()
@@ -1623,6 +1724,34 @@ class MatrixStateRepository:
                 lease_seconds,
             )
         return _record_to_matrix_event_state(row) if row is not None else None
+
+    async def begin_event_write(
+        self,
+        *,
+        matrix_room_id: str,
+        matrix_event_id: str,
+        lease_owner: str,
+        lease_seconds: int = DEFAULT_LEASE_SECONDS,
+    ) -> bool:
+        """Enter the ambiguous external-write region under the current lease."""
+        async with self._pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                UPDATE matrix_event_state
+                SET status = 'owned',
+                    lease_expires_at = NOW() + make_interval(secs => $4::double precision),
+                    updated_at = NOW()
+                WHERE room_id = $1 AND event_id = $2
+                  AND status = 'claimed'
+                  AND lease_owner = $3
+                RETURNING id
+                """,
+                matrix_room_id,
+                matrix_event_id,
+                lease_owner,
+                lease_seconds,
+            )
+        return row is not None
 
     async def mark_event_written(
         self,
@@ -1643,9 +1772,9 @@ class MatrixStateRepository:
         the recorded outcome instead of writing a duplicate.
 
         Only the attempt that holds the fence may stamp its outcome here:
-        with ``lease_owner`` set, the marker must still be in the state this
-        attempt left it in (``claimed`` for a fresh claim, ``owned`` after an
-        adoption) and carry this attempt's lease token. A superseded attempt
+        with ``lease_owner`` set, the marker must still be in ``claimed``
+        (local-only command side effects) or ``owned`` (an external write was
+        entered) and carry this attempt's lease token. A superseded attempt
         — one that raced a takeover and lost — therefore cannot overwrite the
         winner's record; it learns the winning outcome and must surface that
         instead of its own.
@@ -1700,9 +1829,10 @@ class MatrixStateRepository:
     ) -> None:
         """Confirm the marker once all side effects are durably recorded.
 
-        Like every other ledger primitive, the transition is guarded: with a
-        lease token the marker must still belong to this attempt, and it must
-        be in a pre-confirmation state (``claimed``/``owned``/``written``).
+        Like every other ledger primitive, the transition is guarded. A
+        tokenless reconciliation can confirm ``claimed``/``written`` legacy
+        states, while ``owned`` can only be confirmed by the exact lease owner
+        that entered the non-replayable side-effect region.
         A caller that lost the fence — or one racing a just-confirmed
         replay — updates nothing instead of confirming over the winner.
         """
@@ -1712,12 +1842,35 @@ class MatrixStateRepository:
                 UPDATE matrix_event_state
                 SET status = 'processed', updated_at = NOW()
                 WHERE room_id = $1 AND event_id = $2
-                  AND status IN ('claimed', 'owned', 'written')
-                  AND ($3::text IS NULL OR lease_owner = $3::text)
+                  AND (
+                      (status IN ('claimed', 'written')
+                       AND ($3::text IS NULL OR lease_owner = $3::text))
+                      OR
+                      (status = 'owned' AND $3::text IS NOT NULL
+                       AND lease_owner = $3::text)
+                  )
                 """,
                 matrix_room_id,
                 matrix_event_id,
                 lease_owner,
+            )
+
+    async def reconcile_event_from_mapping(
+        self, *, matrix_room_id: str, matrix_event_id: str
+    ) -> None:
+        """Confirm any remaining marker when a delivery mapping proves the write."""
+        async with self._pool.acquire() as connection:
+            await connection.execute(
+                """
+                UPDATE matrix_event_state
+                SET status = 'processed',
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = NOW()
+                WHERE room_id = $1 AND event_id = $2
+                """,
+                matrix_room_id,
+                matrix_event_id,
             )
 
     async def prune_processed_events(self, *, older_than_days: int = 7) -> int:
@@ -1761,9 +1914,10 @@ class MatrixStateRepository:
     ) -> None:
         """Give up an unprocessed claim so a later delivery can retry cleanly.
 
-        Only a marker that provably made no external write can be released:
-        once the outcome is recorded (``written``) or confirmed
-        (``processed``), the fence must survive so a replay never re-writes.
+        Only a ``claimed`` marker, which has not entered an external write,
+        can be released. Once the marker becomes ``owned`` the remote outcome
+        may be ambiguous, so the fence must survive until an operator
+        reconciles it; ``written`` and ``processed`` are also permanent.
         With ``lease_owner`` set, the marker must still carry this attempt's
         token — a superseded attempt must never tear down the fence of the
         attempt that took the lease over.
@@ -1773,7 +1927,7 @@ class MatrixStateRepository:
                 """
                 DELETE FROM matrix_event_state
                 WHERE room_id = $1 AND event_id = $2
-                  AND status IN ('claimed', 'owned')
+                  AND status = 'claimed'
                   AND ($3::text IS NULL OR lease_owner = $3::text)
                 """,
                 matrix_room_id,
