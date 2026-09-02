@@ -423,6 +423,22 @@ class CategoryRepository:
             )
         return _record_to_category(row) if row is not None else None
 
+    async def disable_categories_not_in(self, discourse_category_ids: list[int]) -> None:
+        # Fail-closed companion to the periodic visibility refresh: any category row that
+        # no longer appears in the fresh Discourse listing is disabled so it can never be
+        # bridged off a stale public snapshot. Enabled rows are restored automatically by
+        # the next upsert if the category reappears.
+        async with self._pool.acquire() as connection:
+            await connection.execute(
+                """
+                UPDATE categories
+                SET enabled = FALSE, updated_at = NOW()
+                WHERE enabled = TRUE
+                  AND NOT (discourse_category_id = ANY($1::int[]))
+                """,
+                discourse_category_ids,
+            )
+
 
 class UserWatchRepository:
     def __init__(self, pool: asyncpg.Pool) -> None:
@@ -509,17 +525,35 @@ class UserWatchRepository:
             )
         return [UserWatchRecord(**dict(row)) for row in rows]
 
-    async def list_mxids_for_category(self, *, category_id: int) -> list[str]:
+    async def list_mxids_for_category(
+        self, *, category_id: int, include_non_public: bool = False
+    ) -> list[str]:
         async with self._pool.acquire() as connection:
             rows = await connection.fetch(
                 """
-                SELECT DISTINCT mxid
-                FROM user_watches
-                WHERE (mode = 'category' AND category_id = $1)
-                   OR (mode = 'all_public_categories' AND category_id IS NULL)
-                ORDER BY mxid
+                SELECT DISTINCT uw.mxid
+                FROM user_watches uw
+                WHERE (
+                    (uw.mode = 'category' AND uw.category_id = $1 AND (
+                        $2::boolean
+                        OR EXISTS (
+                            SELECT 1 FROM categories c
+                            WHERE c.id = $1 AND c.is_public = TRUE AND c.enabled = TRUE
+                        )
+                    ))
+                    -- all_public_categories subscribers must never be unlocked by
+                    -- include_non_public: the live-E2E escape hatch authorizes only the
+                    -- explicitly configured category watch / room link path, so a private
+                    -- (e.g. live-E2E test) category never fans out to "all public" watchers.
+                    OR (uw.mode = 'all_public_categories' AND uw.category_id IS NULL AND EXISTS (
+                        SELECT 1 FROM categories c
+                        WHERE c.id = $1 AND c.is_public = TRUE AND c.enabled = TRUE
+                    ))
+                )
+                ORDER BY uw.mxid
                 """,
                 category_id,
+                include_non_public,
             )
         return [str(row["mxid"]) for row in rows]
 
@@ -609,7 +643,9 @@ class RoomLinkRepository:
             ),
         )
 
-    async def list_links_matching_category(self, category_slug: str) -> list[RoomLinkRecord]:
+    async def list_links_matching_category(
+        self, category_slug: str, *, include_non_public: bool = False
+    ) -> list[RoomLinkRecord]:
         async with self._pool.acquire() as connection:
             rows = await connection.fetch(
                 """
@@ -623,11 +659,28 @@ class RoomLinkRepository:
                 FROM room_links rl
                 LEFT JOIN room_link_categories rlc ON rlc.room_link_id = rl.id
                 LEFT JOIN categories c ON c.id = rlc.category_id
+                  AND ($2::boolean OR (c.is_public = TRUE AND c.enabled = TRUE))
                 WHERE rl.enabled = TRUE
-                  AND (rl.include_all_public_categories = TRUE OR c.slug = $1)
+                  AND (
+                        (
+                          rl.include_all_public_categories = TRUE
+                          AND EXISTS (
+                              SELECT 1 FROM categories tc
+                              WHERE tc.slug = $1
+                                -- include_all_public_categories rooms must never be
+                                -- unlocked by include_non_public: the live-E2E escape
+                                -- hatch authorizes only the explicitly configured
+                                -- category path, so a private (e.g. live-E2E test)
+                                -- category never matches "all public" rooms.
+                                AND tc.is_public = TRUE AND tc.enabled = TRUE
+                          )
+                        )
+                        OR c.slug = $1
+                  )
                 ORDER BY rl.id, c.slug
                 """,
                 category_slug,
+                include_non_public,
             )
         grouped: dict[int, RoomLinkRecord] = {}
         category_map: dict[int, list[str]] = {}

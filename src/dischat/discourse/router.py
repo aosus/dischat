@@ -12,7 +12,9 @@ from dischat.storage.repositories import (
 
 
 class RoomLinksRepo(Protocol):
-    async def list_links_matching_category(self, category_slug: str) -> list[RoomLinkRecord]: ...
+    async def list_links_matching_category(
+        self, category_slug: str, *, include_non_public: bool = False
+    ) -> list[RoomLinkRecord]: ...
 
 
 class ChatAccountsRepo(Protocol):
@@ -20,7 +22,9 @@ class ChatAccountsRepo(Protocol):
 
 
 class UserWatchesRepo(Protocol):
-    async def list_mxids_for_category(self, *, category_id: int) -> list[str]: ...
+    async def list_mxids_for_category(
+        self, *, category_id: int, include_non_public: bool = False
+    ) -> list[str]: ...
 
 
 class DeliveryMessagesRepo(Protocol):
@@ -51,9 +55,15 @@ async def route_event(
     user_watches: UserWatchesRepo,
     delivery_messages: DeliveryMessagesRepo,
     delivery_jobs: DeliveryJobsRepo,
+    include_non_public_category: bool = False,
 ) -> None:
+    # `include_non_public_category` is reserved for the live-E2E category exception and is
+    # decided upstream by the poller; production routing must always leave it False so the
+    # repository queries only match public, enabled categories.
     if category_slug is not None and discourse_event.event_type == "new_topic":
-        for room_link in await room_links.list_links_matching_category(category_slug):
+        for room_link in await room_links.list_links_matching_category(
+            category_slug, include_non_public=include_non_public_category
+        ):
             await delivery_jobs.enqueue(
                 event_id=event_id,
                 target_type="room",
@@ -61,7 +71,9 @@ async def route_event(
                 matrix_room_id=room_link.matrix_room_id,
             )
         if category_id is not None:
-            for mxid in await user_watches.list_mxids_for_category(category_id=category_id):
+            for mxid in await user_watches.list_mxids_for_category(
+                category_id=category_id, include_non_public=include_non_public_category
+            ):
                 await delivery_jobs.enqueue(
                     event_id=event_id,
                     target_type="dm",

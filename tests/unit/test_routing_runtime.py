@@ -31,6 +31,12 @@ class FakeDiscourseClient:
         self.latest_posts: list[dict[str, object]] = []
         self.topics: dict[int, dict[str, object]] = {}
         self.posts: dict[int, dict[str, object]] = {}
+        self.category_topics: list[dict[str, object]] = []
+
+    async def list_category_latest_posts(
+        self, *, category_slug: str, category_id: int
+    ) -> list[dict[str, object]]:
+        return self.category_topics
 
     async def create_reply(
         self,
@@ -140,13 +146,19 @@ class FakeRoomLinks:
         self.room_link = room_link
         self.by_category: dict[str, list[RoomLinkRecord]] = {}
         self.by_room: dict[str, RoomLinkRecord] = {}
+        self.matching_calls: list[dict[str, object]] = []
         if room_link is not None:
             self.by_room[room_link.matrix_room_id] = room_link
 
     async def get_by_room_id(self, matrix_room_id: str) -> RoomLinkRecord | None:
         return self.by_room.get(matrix_room_id, self.room_link)
 
-    async def list_links_matching_category(self, category_slug: str) -> list[RoomLinkRecord]:
+    async def list_links_matching_category(
+        self, category_slug: str, *, include_non_public: bool = False
+    ) -> list[RoomLinkRecord]:
+        self.matching_calls.append(
+            {"category_slug": category_slug, "include_non_public": include_non_public}
+        )
         return self.by_category.get(category_slug, [])
 
 
@@ -221,8 +233,14 @@ class FakeAuditLogs:
 class FakeUserWatches:
     def __init__(self) -> None:
         self.mxids_by_category: dict[int, list[str]] = {}
+        self.watch_calls: list[dict[str, object]] = []
 
-    async def list_mxids_for_category(self, *, category_id: int) -> list[str]:
+    async def list_mxids_for_category(
+        self, *, category_id: int, include_non_public: bool = False
+    ) -> list[str]:
+        self.watch_calls.append(
+            {"category_id": category_id, "include_non_public": include_non_public}
+        )
         return self.mxids_by_category.get(category_id, [])
 
 
@@ -464,7 +482,9 @@ async def test_poll_once_resolves_parent_discourse_post_id_before_routing() -> N
         }
     }
     categories = FakeCategories()
-    categories.categories[10] = type("Category", (), {"id": 1, "slug": "support"})()
+    categories.categories[10] = type(
+        "Category", (), {"id": 1, "slug": "support", "is_public": True, "enabled": True}
+    )()
     discourse_events = FakeDiscourseEvents()
 
     processed = await poll_once(
@@ -504,7 +524,9 @@ async def test_poll_once_backfills_cooked_html_from_topic_payload() -> None:
         },
     }
     categories = FakeCategories()
-    categories.categories[10] = type("Category", (), {"id": 1, "slug": "support"})()
+    categories.categories[10] = type(
+        "Category", (), {"id": 1, "slug": "support", "is_public": True, "enabled": True}
+    )()
     discourse_events = FakeDiscourseEvents()
 
     processed = await poll_once(
@@ -656,3 +678,446 @@ async def test_deliver_job_formats_new_topic_with_title_for_room_jobs() -> None:
     ]
     assert matrix.notices == []
     assert matrix.replies == []
+
+
+async def _poll_single_post(
+    discourse: FakeDiscourseClient,
+    categories: FakeCategories,
+    *,
+    room_links: FakeRoomLinks | None = None,
+    user_watches: FakeUserWatches | None = None,
+    live_e2e_category_id: int | None = None,
+) -> tuple[FakeDiscourseEvents, FakeDeliveryJobs, FakeRoomLinks, FakeUserWatches]:
+    discourse_events = FakeDiscourseEvents()
+    jobs = FakeDeliveryJobs()
+    if room_links is None:
+        room_links = FakeRoomLinks()
+    if user_watches is None:
+        user_watches = FakeUserWatches()
+    await poll_once(
+        client=discourse,
+        state=PollerState(),
+        categories=categories,
+        discourse_events=discourse_events,
+        room_links=room_links,
+        chat_accounts=FakeChatAccounts(),
+        user_watches=user_watches,
+        delivery_messages=FakeDeliveryMessages(),
+        delivery_jobs=jobs,
+        live_e2e_category_id=live_e2e_category_id,
+    )
+    return discourse_events, jobs, room_links, user_watches
+
+
+def _category(discourse_category_id: int, *, is_public: bool, enabled: bool = True):
+    return type(
+        "Category",
+        (),
+        {
+            "id": 1,
+            "slug": "support",
+            "name": "Support",
+            "is_public": is_public,
+            "enabled": enabled,
+        },
+    )()
+
+
+def _private_post() -> dict[str, object]:
+    return {
+        "id": 31,
+        "topic_id": 20,
+        "category_id": 99,
+        "username": "alice",
+        "raw": "secret",
+    }
+
+
+async def test_poll_skips_unknown_category_before_creating_event_or_job() -> None:
+    discourse = FakeDiscourseClient()
+    discourse.latest_posts = [_private_post()]
+    categories = FakeCategories()  # category 99 has no bootstrap record
+
+    events, jobs, room_links, watches = await _poll_single_post(discourse, categories)
+
+    assert events.created == []
+    assert jobs.enqueued == []
+    assert room_links.matching_calls == []
+    assert watches.watch_calls == []
+
+
+async def test_poll_skips_non_public_category_before_creating_event_or_job() -> None:
+    discourse = FakeDiscourseClient()
+    discourse.latest_posts = [_private_post()]
+    categories = FakeCategories()
+    # Admin API key sees the restricted post; the bootstrap record says it is not public.
+    categories.categories[99] = _category(99, is_public=False)
+    categories.categories[10] = _category(10, is_public=True)
+    # A watcher and a linked room exist for the private slug to prove they are never used.
+    watches = FakeUserWatches()
+    watches.mxids_by_category[1] = ["@watcher:aosus.org"]
+    room_links = FakeRoomLinks()
+    room_link = RoomLinkRecord(
+        id=1,
+        matrix_room_id="!room:test",
+        include_all_public_categories=True,
+        allow_relay=False,
+        full_content=False,
+        enabled=True,
+        category_slugs=("support",),
+    )
+    room_links.by_category["support"] = [room_link]
+
+    discourse_events = FakeDiscourseEvents()
+    jobs = FakeDeliveryJobs()
+    processed = await poll_once(
+        client=discourse,
+        state=PollerState(),
+        categories=categories,
+        discourse_events=discourse_events,
+        room_links=room_links,
+        chat_accounts=FakeChatAccounts(),
+        user_watches=watches,
+        delivery_messages=FakeDeliveryMessages(),
+        delivery_jobs=jobs,
+    )
+
+    assert processed == 0
+    assert discourse_events.created == []
+    assert jobs.enqueued == []
+    assert room_links.matching_calls == []
+    assert watches.watch_calls == []
+
+
+async def test_poll_skips_disabled_category_before_creating_event_or_job() -> None:
+    discourse = FakeDiscourseClient()
+    discourse.latest_posts = [_private_post()]
+    categories = FakeCategories()
+    categories.categories[99] = _category(99, is_public=True, enabled=False)
+
+    events, jobs, room_links, watches = await _poll_single_post(discourse, categories)
+
+    assert events.created == []
+    assert jobs.enqueued == []
+    assert room_links.matching_calls == []
+    assert watches.watch_calls == []
+
+
+async def test_poll_routes_public_category_normally() -> None:
+    discourse = FakeDiscourseClient()
+    post = dict(_private_post(), category_id=10)
+    discourse.latest_posts = [post]
+    categories = FakeCategories()
+    categories.categories[10] = _category(10, is_public=True)
+    room_links = FakeRoomLinks()
+    room_link = RoomLinkRecord(
+        id=1,
+        matrix_room_id="!room:test",
+        include_all_public_categories=True,
+        allow_relay=False,
+        full_content=False,
+        enabled=True,
+        category_slugs=("support",),
+    )
+    room_links.by_category["support"] = [room_link]
+    watches = FakeUserWatches()
+    watches.mxids_by_category[1] = ["@watcher:aosus.org"]
+
+    events, jobs, room_links_used, watches_used = await _poll_single_post(
+        discourse, categories, room_links=room_links, user_watches=watches
+    )
+
+    assert events.created != []
+    assert jobs.enqueued == [
+        {
+            "event_id": 1,
+            "target_type": "room",
+            "target_mxid": None,
+            "matrix_room_id": "!room:test",
+        },
+        {
+            "event_id": 1,
+            "target_type": "dm",
+            "target_mxid": "@watcher:aosus.org",
+            "matrix_room_id": None,
+        },
+    ]
+    assert room_links_used.matching_calls == [
+        {"category_slug": "support", "include_non_public": False}
+    ]
+    assert watches_used.watch_calls == [{"category_id": 1, "include_non_public": False}]
+
+
+async def test_poll_skips_category_that_turns_non_public_between_polls() -> None:
+    # Regression: an admin restricts the category while the bridge is running. The stored
+    # row is refreshed and the poller must stop bridging it even though earlier posts in
+    # the same run were delivered — no event, no delivery job, no routing calls.
+    discourse = FakeDiscourseClient()
+    categories = FakeCategories()
+    categories.categories[99] = _category(99, is_public=True)
+    room_links = FakeRoomLinks()
+    room_link = RoomLinkRecord(
+        id=1,
+        matrix_room_id="!room:test",
+        include_all_public_categories=True,
+        allow_relay=False,
+        full_content=False,
+        enabled=True,
+        category_slugs=("support",),
+    )
+    room_links.by_category["support"] = [room_link]
+    watches = FakeUserWatches()
+    watches.mxids_by_category[1] = ["@watcher:aosus.org"]
+
+    discourse.latest_posts = [dict(_private_post(), id=31)]
+    discourse_events = FakeDiscourseEvents()
+    jobs = FakeDeliveryJobs()
+    state = PollerState()
+
+    first_processed = await poll_once(
+        client=discourse,
+        state=state,
+        categories=categories,
+        discourse_events=discourse_events,
+        room_links=room_links,
+        chat_accounts=FakeChatAccounts(),
+        user_watches=watches,
+        delivery_messages=FakeDeliveryMessages(),
+        delivery_jobs=jobs,
+    )
+    assert first_processed == 1
+    assert len(jobs.enqueued) == 2
+
+    # Admin makes the category read-restricted while Dischat is running.
+    categories.categories[99] = _category(99, is_public=False)
+    discourse.latest_posts = [dict(_private_post(), id=32)]
+
+    second_processed = await poll_once(
+        client=discourse,
+        state=state,
+        categories=categories,
+        discourse_events=discourse_events,
+        room_links=room_links,
+        chat_accounts=FakeChatAccounts(),
+        user_watches=watches,
+        delivery_messages=FakeDeliveryMessages(),
+        delivery_jobs=jobs,
+    )
+
+    assert second_processed == 0
+    assert len(discourse_events.created) == 1
+    assert len(jobs.enqueued) == 2
+    assert room_links.matching_calls == [{"category_slug": "support", "include_non_public": False}]
+    assert watches.watch_calls == [{"category_id": 1, "include_non_public": False}]
+
+
+async def test_poll_skips_category_removed_between_polls() -> None:
+    # A category deleted (or newly unknown) after the bootstrap snapshot must fail closed.
+    discourse = FakeDiscourseClient()
+    categories = FakeCategories()
+    categories.categories[99] = _category(99, is_public=True)
+    discourse.latest_posts = [dict(_private_post(), id=41)]
+    discourse_events = FakeDiscourseEvents()
+    jobs = FakeDeliveryJobs()
+    state = PollerState()
+
+    assert (
+        await poll_once(
+            client=discourse,
+            state=state,
+            categories=categories,
+            discourse_events=discourse_events,
+            room_links=FakeRoomLinks(),
+            chat_accounts=FakeChatAccounts(),
+            user_watches=FakeUserWatches(),
+            delivery_messages=FakeDeliveryMessages(),
+            delivery_jobs=jobs,
+        )
+        == 1
+    )
+
+    del categories.categories[99]
+    discourse.latest_posts = [dict(_private_post(), id=42)]
+
+    processed = await poll_once(
+        client=discourse,
+        state=state,
+        categories=categories,
+        discourse_events=discourse_events,
+        room_links=FakeRoomLinks(),
+        chat_accounts=FakeChatAccounts(),
+        user_watches=FakeUserWatches(),
+        delivery_messages=FakeDeliveryMessages(),
+        delivery_jobs=jobs,
+    )
+
+    assert processed == 0
+    assert len(discourse_events.created) == 1
+    assert len(jobs.enqueued) == 0
+
+
+async def test_live_e2e_mode_allows_the_test_category_despite_non_public_record() -> None:
+    discourse = FakeDiscourseClient()
+    discourse.category_topics = [{"id": 20}]
+    discourse.topics[20] = {
+        "category_id": 56,
+        "title": "Live E2E topic",
+        "post_stream": {"posts": [_private_post()]},
+    }
+    discourse.latest_posts = []
+    for post in discourse.topics[20]["post_stream"]["posts"]:
+        post["topic_id"] = 20
+    categories = FakeCategories()
+    # The live-E2E category is read-restricted on Discourse but explicitly bootstrapped.
+    categories.categories[56] = _category(56, is_public=False)
+    room_links = FakeRoomLinks()
+    room_link = RoomLinkRecord(
+        id=1,
+        matrix_room_id="!room:test",
+        include_all_public_categories=False,
+        allow_relay=False,
+        full_content=False,
+        enabled=True,
+        category_slugs=("support",),
+    )
+    room_links.by_category["support"] = [room_link]
+    watches = FakeUserWatches()
+    watches.mxids_by_category[1] = ["@watcher:aosus.org"]
+
+    discourse_events = FakeDiscourseEvents()
+    jobs = FakeDeliveryJobs()
+    processed = await poll_once(
+        client=discourse,
+        state=PollerState(),
+        categories=categories,
+        discourse_events=discourse_events,
+        room_links=room_links,
+        chat_accounts=FakeChatAccounts(),
+        user_watches=watches,
+        delivery_messages=FakeDeliveryMessages(),
+        delivery_jobs=jobs,
+        live_e2e_category_id=56,
+    )
+
+    assert processed == 1
+    assert discourse_events.created != []
+    assert jobs.enqueued == [
+        {
+            "event_id": 1,
+            "target_type": "room",
+            "target_mxid": None,
+            "matrix_room_id": "!room:test",
+        },
+        {
+            "event_id": 1,
+            "target_type": "dm",
+            "target_mxid": "@watcher:aosus.org",
+            "matrix_room_id": None,
+        },
+    ]
+    assert room_links.matching_calls == [{"category_slug": "support", "include_non_public": True}]
+    assert watches.watch_calls == [{"category_id": 1, "include_non_public": True}]
+
+
+async def test_live_e2e_bypass_never_fans_private_category_out_to_all_public_watchers_and_rooms() -> (
+    None
+):
+    # Regression: the live-E2E escape hatch authorizes only the explicitly configured
+    # category path. A room linked via include_all_public_categories and a user with an
+    # all_public_categories watch must NOT receive the private test category, even though
+    # they would receive every genuinely public category.
+    discourse = FakeDiscourseClient()
+    discourse.category_topics = [{"id": 20}]
+    discourse.topics[20] = {
+        "category_id": 56,
+        "title": "Live E2E topic",
+        "post_stream": {"posts": [_private_post()]},
+    }
+    discourse.latest_posts = []
+    for post in discourse.topics[20]["post_stream"]["posts"]:
+        post["topic_id"] = 20
+    categories = FakeCategories()
+    categories.categories[56] = _category(56, is_public=False)
+    # The private test category has no explicit room link, only an all-public room.
+    room_links = FakeRoomLinks()
+    all_public_room = RoomLinkRecord(
+        id=2,
+        matrix_room_id="!all-public:test",
+        include_all_public_categories=True,
+        allow_relay=False,
+        full_content=False,
+        enabled=True,
+        category_slugs=(),
+    )
+    room_links.by_category["all"] = [all_public_room]
+    # And no explicit category watch — only an all_public_categories watch.
+    watches = FakeUserWatches()
+    watches.mxids_by_category[999] = ["@all:aosus.org"]
+
+    discourse_events = FakeDiscourseEvents()
+    jobs = FakeDeliveryJobs()
+    processed = await poll_once(
+        client=discourse,
+        state=PollerState(),
+        categories=categories,
+        discourse_events=discourse_events,
+        room_links=room_links,
+        chat_accounts=FakeChatAccounts(),
+        user_watches=watches,
+        delivery_messages=FakeDeliveryMessages(),
+        delivery_jobs=jobs,
+        live_e2e_category_id=56,
+    )
+
+    # The test category's own event may still be processed (that is the point of the
+    # escape hatch), but NOTHING may be enqueued: the router still queries the category
+    # path with the escape hatch, but there is no explicitly linked room and no explicit
+    # watch — and critically the all-public room/watch never match it.
+    assert processed == 1
+    assert discourse_events.created != []
+    assert jobs.enqueued == []
+    assert room_links.matching_calls == [{"category_slug": "support", "include_non_public": True}]
+    assert watches.watch_calls == [{"category_id": 1, "include_non_public": True}]
+
+
+async def test_route_event_defaults_never_reactivate_non_public_matching() -> None:
+    jobs = FakeDeliveryJobs()
+
+    await route_event(
+        event_id=7,
+        discourse_event=DiscourseEvent(
+            discourse_topic_id=20,
+            discourse_post_id=31,
+            reply_to_post_number=None,
+            event_type="new_topic",
+            category_id=1,
+            author_username="alice",
+            target_discourse_username=None,
+            raw_payload_json={},
+        ),
+        category_slug="support",
+        category_id=1,
+        room_links=FakeRoomLinks(),
+        chat_accounts=FakeChatAccounts(),
+        user_watches=FakeUserWatches(),
+        delivery_messages=FakeDeliveryMessages(),
+        delivery_jobs=jobs,
+    )
+
+    assert jobs.enqueued == []
+
+
+async def test_non_public_category_gets_no_exception_outside_live_e2e_mode() -> None:
+    # The same discourse category id that live-E2E would allow must stay blocked in
+    # production mode: the exception exists only when live_e2e_category_id is configured.
+    discourse = FakeDiscourseClient()
+    discourse.latest_posts = [dict(_private_post(), category_id=56)]
+    categories = FakeCategories()
+    categories.categories[56] = _category(56, is_public=False)
+
+    events, jobs, room_links, watches = await _poll_single_post(discourse, categories)
+
+    assert events.created == []
+    assert jobs.enqueued == []
+    assert room_links.matching_calls == []
+    assert watches.watch_calls == []
