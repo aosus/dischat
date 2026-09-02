@@ -13,6 +13,10 @@ WatchMode = Literal["category", "all_public_categories"]
 JobStatus = Literal["pending", "running", "complete", "failed"]
 TargetType = Literal["dm", "room"]
 
+# Default lease for claimed delivery jobs; a 'running' job becomes claimable
+# again once its lease expires (crashed-worker recovery window).
+DEFAULT_JOB_LEASE_SECONDS = 120
+
 
 @dataclass(slots=True, frozen=True)
 class ChatAccount:
@@ -103,6 +107,12 @@ class DeliveryJobRecord:
     attempts: int
     next_attempt_at: datetime
     last_error: str | None
+    claimed_at: datetime | None = None
+    lease_expires_at: datetime | None = None
+    matrix_tx_id: str | None = None
+    matrix_device_id: str | None = None
+    matrix_dm_room_id: str | None = None
+    claim_token: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -183,6 +193,12 @@ def _record_to_delivery_job(row: asyncpg.Record) -> DeliveryJobRecord:
         attempts=row["attempts"],
         next_attempt_at=row["next_attempt_at"],
         last_error=row["last_error"],
+        claimed_at=row["claimed_at"],
+        lease_expires_at=row["lease_expires_at"],
+        matrix_tx_id=row["matrix_tx_id"],
+        matrix_device_id=row["matrix_device_id"],
+        matrix_dm_room_id=row["matrix_dm_room_id"],
+        claim_token=row["claim_token"],
     )
 
 
@@ -1103,15 +1119,34 @@ class DeliveryJobRepository:
         assert row is not None
         return _record_to_delivery_job(row)
 
-    async def claim_next_job(self) -> DeliveryJobRecord | None:
+    async def claim_next_job(
+        self, *, lease_seconds: int = DEFAULT_JOB_LEASE_SECONDS
+    ) -> DeliveryJobRecord | None:
+        """Claim the next due job and hold a bounded lease on it.
+
+        Claimable jobs are 'pending'/'failed' jobs that are due, plus 'running'
+        jobs whose lease has expired (crashed worker recovery). The lease is
+        stamped on claim so a worker that dies mid-delivery cannot strand the
+        job in 'running' forever; once the lease lapses the next claim cycle
+        reclaims it. It also holds the at-least-once caveat: because an expired
+        'running' row means the previous attempt's outcome is unknown, callers
+        must reconcile against the delivery-message mapping before re-sending
+        (see deliver_job).
+        """
         async with self._pool.acquire() as connection:
             row = await connection.fetchrow(
                 """
                 WITH next_job AS (
                     SELECT id
                     FROM delivery_jobs
-                    WHERE status IN ('pending', 'failed')
-                      AND next_attempt_at <= NOW()
+                    WHERE (
+                            status IN ('pending', 'failed')
+                            AND next_attempt_at <= NOW()
+                        )
+                        OR (
+                            status = 'running'
+                            AND COALESCE(lease_expires_at, NOW()) <= NOW()
+                        )
                     ORDER BY created_at
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
@@ -1119,39 +1154,171 @@ class DeliveryJobRepository:
                 UPDATE delivery_jobs
                 SET status = 'running',
                     attempts = attempts + 1,
+                    claimed_at = NOW(),
+                    lease_expires_at = NOW() + make_interval(secs => $1),
+                    -- Fencing token: a fresh, unique token per claim so renewal
+                    -- and terminal updates from an earlier (stale) claim are
+                    -- rejected by the claim_token guard below.
+                    claim_token = 'claim-' || id::text || '-' || gen_random_uuid()::text,
                     updated_at = NOW()
                 WHERE id IN (SELECT id FROM next_job)
                 RETURNING *
-                """
+                """,
+                float(lease_seconds),
             )
         return _record_to_delivery_job(row) if row is not None else None
 
-    async def mark_complete(self, job_id: int) -> None:
+    async def ensure_matrix_tx_id(self, job_id: int) -> str:
+        """Return the job's durable Matrix transaction id, creating it once.
+
+        The id is persisted BEFORE any Matrix write. Every attempt of this job
+        reuses it, so a retry after a crash between homeserver acceptance and
+        mapping persistence deduplicates on the homeserver instead of posting
+        the message twice (Matrix dedupes sends by (device, transaction id)).
+        """
         async with self._pool.acquire() as connection:
-            await connection.execute(
+            row = await connection.fetchrow(
+                """
+                UPDATE delivery_jobs
+                SET matrix_tx_id = COALESCE(
+                        matrix_tx_id,
+                        'dischat-' || id::text || '-' || gen_random_uuid()::text
+                    ),
+                    updated_at = NOW()
+                WHERE id = $1
+                RETURNING matrix_tx_id
+                """,
+                job_id,
+            )
+        assert row is not None
+        return row["matrix_tx_id"]
+
+    async def ensure_matrix_device_id(self, job_id: int, *, device_id: str) -> str:
+        """Stamp the bot's Matrix device id on the job (idempotent).
+
+        Transaction ids are scoped to a device: deduplication only works if the
+        retrying process logs in as the SAME device. The client resolves its
+        (stable) device id and stamps it here so restarts reuse it instead of
+        minting a new device per password login.
+        """
+        async with self._pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                UPDATE delivery_jobs
+                SET matrix_device_id = COALESCE(matrix_device_id, $2),
+                    updated_at = NOW()
+                WHERE id = $1
+                RETURNING matrix_device_id
+                """,
+                job_id,
+                device_id,
+            )
+        assert row is not None
+        return row["matrix_device_id"]
+
+    async def get_matrix_dm_room_id(self, job_id: int) -> str | None:
+        """Return the DM room pinned for this job, if any."""
+        async with self._pool.acquire() as connection:
+            row = await connection.fetchrow(
+                "SELECT matrix_dm_room_id FROM delivery_jobs WHERE id = $1", job_id
+            )
+        assert row is not None
+        return row["matrix_dm_room_id"]
+
+    async def pin_matrix_dm_room(self, job_id: int, *, room_id: str) -> str:
+        """Pin the DM room a job's sends must go to (idempotent).
+
+        Transaction ids are scoped per HTTP endpoint (/rooms/{roomId}/send/...).
+        If a retry re-resolved the DM room and picked a different one, the same
+        tx id would hit a different endpoint and could not deduplicate — so the
+        first resolved room is persisted and every attempt reuses it.
+        """
+        async with self._pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                UPDATE delivery_jobs
+                SET matrix_dm_room_id = COALESCE(matrix_dm_room_id, $2),
+                    updated_at = NOW()
+                WHERE id = $1
+                RETURNING matrix_dm_room_id
+                """,
+                job_id,
+                room_id,
+            )
+        assert row is not None
+        return row["matrix_dm_room_id"]
+
+    async def renew_lease(
+        self, job_id: int, *, claim_token: str, lease_seconds: int
+    ) -> datetime | None:
+        """Extend the lease on a claimed job if the caller still owns the claim.
+
+        The update is fenced on the claim token AND `status = 'running'`: after
+        a lease expiry and reclaim, the previous worker's token no longer
+        matches and its renewal is ignored (returns None) instead of extending
+        the newer claim's lease.
+        """
+        async with self._pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                UPDATE delivery_jobs
+                SET lease_expires_at = NOW() + make_interval(secs => $3),
+                    updated_at = NOW()
+                WHERE id = $1 AND claim_token = $2 AND status = 'running'
+                RETURNING lease_expires_at
+                """,
+                job_id,
+                claim_token,
+                float(lease_seconds),
+            )
+        return row["lease_expires_at"] if row is not None else None
+
+    async def mark_complete(self, job_id: int, *, claim_token: str) -> bool:
+        """Mark a job complete if the caller still owns the claim.
+
+        Returns False (and changes nothing) when the claim token no longer
+        matches — e.g. the caller's lease expired and another worker reclaimed
+        the job — or when the job is not 'running' anymore.
+        """
+        async with self._pool.acquire() as connection:
+            row = await connection.fetchrow(
                 """
                 UPDATE delivery_jobs
                 SET status = 'complete', updated_at = NOW(), last_error = NULL
-                WHERE id = $1
+                WHERE id = $1 AND claim_token = $2 AND status = 'running'
+                RETURNING id
                 """,
                 job_id,
+                claim_token,
             )
+        return row is not None
 
-    async def mark_failed(self, job_id: int, *, error: str, next_attempt_at: datetime) -> None:
+    async def mark_failed(
+        self, job_id: int, *, claim_token: str, error: str, next_attempt_at: datetime
+    ) -> bool:
+        """Mark a job failed (retryable) if the caller still owns the claim.
+
+        Fenced exactly like mark_complete: a stale worker whose job was
+        reclaimed cannot clobber the newer claim's state or schedule a
+        competing retry. Returns False when the update was rejected.
+        """
         async with self._pool.acquire() as connection:
-            await connection.execute(
+            row = await connection.fetchrow(
                 """
                 UPDATE delivery_jobs
                 SET status = 'failed',
-                    last_error = $2,
-                    next_attempt_at = $3,
+                    last_error = $3,
+                    next_attempt_at = $4,
                     updated_at = NOW()
-                WHERE id = $1
+                WHERE id = $1 AND claim_token = $2 AND status = 'running'
+                RETURNING id
                 """,
                 job_id,
+                claim_token,
                 error,
                 next_attempt_at,
             )
+        return row is not None
 
     async def get(self, job_id: int) -> DeliveryJobRecord | None:
         async with self._pool.acquire() as connection:

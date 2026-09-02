@@ -56,9 +56,12 @@ class FakeMatrixClient:
         self.notices.append((room_id, body))
         return MatrixSendResult(event_id="$notice", room_id=room_id)
 
-    async def send_dm(self, mxid: str, body: str) -> MatrixSendResult:
-        self.dms.append((mxid, body))
-        return MatrixSendResult(event_id="$dm", room_id="!dm:test")
+    async def resolve_dm_room(self, mxid: str) -> str:
+        return "!dm:test"
+
+    async def send_dm(self, room_id: str, body: str) -> MatrixSendResult:
+        self.dms.append((room_id, body))
+        return MatrixSendResult(event_id="$dm", room_id=room_id)
 
     async def send_reply(self, room_id: str, body: str, parent_event_id: str) -> MatrixSendResult:
         self.replies.append((room_id, body, parent_event_id))

@@ -67,11 +67,16 @@ class FakeDiscourseClient:
 
 
 class FakeMatrixClient:
+    device_id: str | None = "DEVICE-ROUTING-TEST"
+
     def __init__(self) -> None:
         self.texts: list[tuple[str, str, dict[str, str] | None]] = []
         self.notices: list[tuple[str, str]] = []
         self.dms: list[tuple[str, str]] = []
         self.replies: list[tuple[str, str, str, dict[str, str] | None]] = []
+        # Room "resolved" for unpinned DM sends; tests can rotate this.
+        self.next_dm_room: str = "!dm:test"
+        self.resolved_rooms: list[str] = []
 
     async def send_text(
         self,
@@ -79,6 +84,7 @@ class FakeMatrixClient:
         body: str,
         *,
         formatted: dict[str, str] | None = None,
+        tx_id: str | None = None,
     ) -> MatrixSendResult:
         self.texts.append((room_id, body, formatted))
         return MatrixSendResult(event_id="$text", room_id=room_id)
@@ -87,15 +93,20 @@ class FakeMatrixClient:
         self.notices.append((room_id, body))
         return MatrixSendResult(event_id="$notice", room_id=room_id)
 
+    async def resolve_dm_room(self, mxid: str) -> str:
+        self.resolved_rooms.append(mxid)
+        return self.next_dm_room
+
     async def send_dm(
         self,
-        mxid: str,
+        room_id: str,
         body: str,
         *,
         formatted: dict[str, str] | None = None,
+        tx_id: str | None = None,
     ) -> MatrixSendResult:
-        self.dms.append((mxid, body))
-        return MatrixSendResult(event_id="$dm", room_id="!dm:test")
+        self.dms.append((room_id, body))
+        return MatrixSendResult(event_id="$dm", room_id=room_id)
 
     async def send_reply(
         self,
@@ -104,6 +115,7 @@ class FakeMatrixClient:
         parent_event_id: str,
         *,
         formatted: dict[str, str] | None = None,
+        tx_id: str | None = None,
     ) -> MatrixSendResult:
         self.replies.append((room_id, body, parent_event_id, formatted))
         return MatrixSendResult(event_id="$reply", room_id=room_id)

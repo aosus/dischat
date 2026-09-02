@@ -37,12 +37,16 @@ class MatrixMessage:
 
 
 class MatrixClient(Protocol):
+    @property
+    def device_id(self) -> str | None: ...
+
     async def send_text(
         self,
         room_id: str,
         body: str,
         *,
         formatted: dict[str, str] | None = None,
+        tx_id: str | None = None,
     ) -> MatrixSendResult: ...
 
     async def send_notice(self, room_id: str, body: str) -> MatrixSendResult: ...
@@ -54,14 +58,18 @@ class MatrixClient(Protocol):
         parent_event_id: str,
         *,
         formatted: dict[str, str] | None = None,
+        tx_id: str | None = None,
     ) -> MatrixSendResult: ...
+
+    async def resolve_dm_room(self, mxid: str) -> str: ...
 
     async def send_dm(
         self,
-        mxid: str,
+        room_id: str,
         body: str,
         *,
         formatted: dict[str, str] | None = None,
+        tx_id: str | None = None,
     ) -> MatrixSendResult: ...
 
 
@@ -75,11 +83,14 @@ class NioMatrixClient:
         user_id: str,
         access_token: str | None,
         password: str | None,
+        device_id: str | None = None,
     ) -> None:
         self._cache_key = (homeserver_url, user_id)
+        self._device_id = device_id
         self._client = AsyncClient(
             homeserver_url,
             user_id,
+            device_id=device_id,
             config=AsyncClientConfig(
                 max_limit_exceeded=0,
                 request_timeout=30,
@@ -98,6 +109,11 @@ class NioMatrixClient:
         return self._client.user_id
 
     @property
+    def device_id(self) -> str | None:
+        """The device this client logs in as (stable when configured)."""
+        return self._device_id or getattr(self._client, "device_id", None)
+
+    @property
     def access_token(self) -> str | None:
         return self._client.access_token
 
@@ -110,6 +126,10 @@ class NioMatrixClient:
         if isinstance(response, LoginError):
             raise ValueError(f"Matrix login failed: {response.message}")
         assert isinstance(response, LoginResponse)
+        # Transaction ids are scoped to a device: a password login without a
+        # stable device_id mints a NEW device on every restart, which would
+        # invalidate the job rows' persisted tx ids. With MATRIX_DEVICE_ID set,
+        # nio re-logs in as the same device and the durable tx ids stay valid.
         if self._client.access_token is not None:
             self._access_token_cache[self._cache_key] = self._client.access_token
 
@@ -156,13 +176,14 @@ class NioMatrixClient:
         body: str,
         *,
         formatted: dict[str, str] | None = None,
+        tx_id: str | None = None,
     ) -> MatrixSendResult:
         content = (
             rich_text(body, formatted_body=formatted["formatted_body"])
             if formatted is not None and "formatted_body" in formatted
             else plain_text(body)
         )
-        response = await self._client.room_send(room_id, "m.room.message", content)
+        response = await self._client.room_send(room_id, "m.room.message", content, tx_id=tx_id)
         if not isinstance(response, RoomSendResponse):
             raise ValueError(f"Matrix send_text failed: {response}")
         return MatrixSendResult(event_id=response.event_id, room_id=room_id)
@@ -174,6 +195,7 @@ class NioMatrixClient:
         parent_event_id: str,
         *,
         formatted: dict[str, str] | None = None,
+        tx_id: str | None = None,
     ) -> MatrixSendResult:
         response = await self._client.room_send(
             room_id,
@@ -187,12 +209,18 @@ class NioMatrixClient:
                     else None
                 ),
             ),
+            tx_id=tx_id,
         )
         if not isinstance(response, RoomSendResponse):
             raise ValueError(f"Matrix send_reply failed: {response}")
         return MatrixSendResult(event_id=response.event_id, room_id=room_id)
 
-    async def ensure_dm_room(self, mxid: str) -> str:
+    async def resolve_dm_room(self, mxid: str) -> str:
+        """Resolve (or create) the DM room for a user without sending.
+
+        Callers must persist the returned room id on the job BEFORE the first
+        Matrix write so retries target the same /rooms/{roomId}/send endpoint.
+        """
         joined = await self._client.joined_rooms()
         if hasattr(joined, "rooms"):
             for room_id in joined.rooms:
@@ -208,13 +236,22 @@ class NioMatrixClient:
 
     async def send_dm(
         self,
-        mxid: str,
+        room_id: str,
         body: str,
         *,
         formatted: dict[str, str] | None = None,
+        tx_id: str | None = None,
     ) -> MatrixSendResult:
-        room_id = await self.ensure_dm_room(mxid)
-        response = await self.send_text(room_id, body, formatted=formatted)
+        """Send a DM to an already-resolved room id.
+
+        Transaction ids are scoped per endpoint (/rooms/{roomId}/send/...), so
+        every attempt of a job must send to the SAME room. Callers resolve via
+        resolve_dm_room(), persist the room id on the job, and only then send —
+        see deliver_job().
+        """
+        if room_id not in self._client.rooms:
+            await self.join_room(room_id)
+        response = await self.send_text(room_id, body, formatted=formatted, tx_id=tx_id)
         return MatrixSendResult(event_id=response.event_id, room_id=room_id)
 
     async def get_event(self, *, room_id: str, event_id: str) -> dict[str, Any]:

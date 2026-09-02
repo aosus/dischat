@@ -5,7 +5,14 @@ from typing import Any
 from dischat.config import FileConfig
 from dischat.discourse.sync import PollerState, poll_once
 from dischat.main import drain_delivery_jobs, refresh_category_visibility, run_iteration
-from dischat.storage.repositories import DeliveryJobRecord, RoomLinkRecord, TargetType
+from dischat.storage.repositories import (
+    DEFAULT_JOB_LEASE_SECONDS,
+    DeliveryJobRecord,
+    RoomLinkRecord,
+    TargetType,
+)
+
+DEFAULT_TEST_LEASE_SECONDS = DEFAULT_JOB_LEASE_SECONDS
 
 
 class FakeMatrixClient:
@@ -99,17 +106,23 @@ class FakeDeliveryJobs:
         self.completed: list[int] = []
         self.failed: list[dict[str, object]] = []
         self.enqueued: list[dict[str, object]] = []
+        self.claim_lease_seconds: list[int] = []
 
-    async def claim_next_job(self) -> DeliveryJobRecord | None:
+    async def claim_next_job(self, *, lease_seconds: int = DEFAULT_TEST_LEASE_SECONDS):
+        self.claim_lease_seconds.append(lease_seconds)
         if not self.jobs:
             return None
         return self.jobs.pop(0)
 
-    async def mark_complete(self, job_id: int) -> None:
+    async def mark_complete(self, job_id: int, *, claim_token: str = "") -> bool:
         self.completed.append(job_id)
+        return True
 
-    async def mark_failed(self, job_id: int, *, error: str, next_attempt_at: datetime) -> None:
+    async def mark_failed(
+        self, job_id: int, *, claim_token: str = "", error: str, next_attempt_at: datetime
+    ) -> bool:
         self.failed.append({"job_id": job_id, "error": error, "next_attempt_at": next_attempt_at})
+        return True
 
     async def enqueue(
         self,

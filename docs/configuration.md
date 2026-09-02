@@ -15,5 +15,7 @@ Key environment variables:
 - `DISCOURSE_RELAY_TELEGRAM_USERNAME`
 - `DISCOURSE_RELAY_DISCORD_USERNAME`
 - `POLL_INTERVAL_SECONDS`
+- `DELIVERY_JOB_LEASE_SECONDS` (default 120; how long a claimed delivery job
+  stays `running` before another worker may reclaim it — see operations doc)
 - `CONFIG_FILE`
 - `DEFAULT_LOCALE`
