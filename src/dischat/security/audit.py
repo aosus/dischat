@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -87,51 +86,8 @@ class MissingAuditIdError(RuntimeError):
         super().__init__("audit repository returned no audit id for live write attempt")
 
 
-# Secrets that must never reach audit_logs.error_message, even when an
-# exception embeds them (httpx/httpcore embed the full request URL in
-# connect errors; Discourse/Matrix exceptions can echo request bodies).
-_REDACTED = "[REDACTED]"
-
-_SECRET_ASSIGNMENT = re.compile(
-    r"(?i)\b(api[_-]?key|api[_-]?secret|access[_-]?token|auth[_-]?token"
-    r"|refresh[_-]?token|password|passwd|secret|token)\s*[=:]\s*[^\s'\",;)\]]+"
-)
-_BEARER_TOKEN = re.compile(r"(?i)\bbearer\s+[^\s'\",;)\]]+")
-_PAIRING_CODE = re.compile(r"(?i)pairing[_ -]?code\s*\S*")
-# URL with embedded credentials (userinfo): redact the whole URL.
-_URL_WITH_CREDENTIALS = re.compile(
-    r"(?i)\bhttps?://[^\s/'\"\\)\]]*:[^\s/@'\"\\)\]]*@[^\s'\"\\)\]]*"
-)
-# Any other http(s) URL: keep scheme+host, redact path+query (paths can
-# embed access tokens, queries embed credentials).
-_URL = re.compile(r"(?i)(https?://[^/?\s'\"\\)\]]+)([^\s'\"\\)\]]*)")
-
-
-def _redact_url(match: re.Match[str]) -> str:
-    scheme_and_host, path_and_query = match.group(1), match.group(2)
-    if path_and_query:
-        return f"{scheme_and_host}/{_REDACTED}"
-    return scheme_and_host
-
-
-def _redact_secrets(text: str) -> str:
-    text = _SECRET_ASSIGNMENT.sub(_REDACTED, text)
-    text = _BEARER_TOKEN.sub(_REDACTED, text)
-    text = _PAIRING_CODE.sub(_REDACTED, text)
-    text = _URL_WITH_CREDENTIALS.sub(_REDACTED, text)
-    text = _URL.sub(_redact_url, text)
-    return text
-
-
 def failure_reason(exc: BaseException) -> str:
-    """Extract a stable, single-line, secret-free failure reason.
-
-    Raw exception text is treated as untrusted: it is redacted for known
-    secret-bearing shapes (tokens, keys, URLs with credentials, query
-    strings, pairing codes) before the newline flattening and 200-character
-    truncation. The exception class name is always preserved as the stable
-    prefix so triage does not depend on exception text surviving redaction.
-    """
+    """Return only the exception class, never untrusted exception text."""
     # Exception messages can echo arbitrary request bodies and credentials;
     # regex redaction can never prove such text safe. Persist only the stable
     # exception class. Full diagnostics remain in ephemeral application logs.
@@ -205,11 +161,10 @@ async def update_audit_outcome(
 ) -> None:
     """Update a pending attempt row with its final outcome.
 
-    Called AFTER the external write and BEFORE any dependent local
-    persistence (delivery mapping insert), so a crash between the write and
-    the mapping still leaves the audit row resolvable: present with
-    status='pending' and success=NULL. post_id / matrix_event_id record the
-    external write's identifier when the target system returned one.
+    Called AFTER the external write and BEFORE dependent local persistence.
+    Once this update succeeds, a later mapping failure leaves a truthful
+    successful audit row with the external identifier. A crash before this
+    update leaves the attempt unresolved (`pending`, NULL).
     """
     if audit_logs is None or audit_log_id is None:
         return

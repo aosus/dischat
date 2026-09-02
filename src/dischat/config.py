@@ -58,7 +58,7 @@ class Settings(BaseSettings):
     matrix_event_retention_days: int = Field(default=7, gt=0, alias="MATRIX_EVENT_RETENTION_DAYS")
 
     def load_file_config(self) -> FileConfig:
-        if not self.config_file.exists():
+        if not self.config_file.is_file():
             return FileConfig()
         payload = yaml.safe_load(self.config_file.read_text(encoding="utf-8")) or {}
         return FileConfig.model_validate(payload)

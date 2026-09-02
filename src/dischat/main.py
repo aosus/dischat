@@ -131,8 +131,8 @@ async def refresh_category_visibility(*, context, settings, poll_state: PollerSt
     # is exactly the dangerous case — the last-known snapshot no longer proves anything
     # is still public, so this FAILS CLOSED: the snapshot is marked stale and polling is
     # suspended until a refresh succeeds. `run_iteration` retries on every subsequent
-    # iteration; Matrix sync/commands and delivery of already-enqueued jobs are
-    # unaffected. On success the snapshot is revalidated and the stale flag clears.
+    # iteration. Matrix sync/commands remain available; queued delivery is
+    # paused when its separate pre-drain refresh cannot prove visibility.
     try:
         discourse_categories = await context.discourse_client.list_categories()
         category_lookup = await sync_categories_from_discourse(
@@ -189,11 +189,9 @@ async def run_iteration(
     # Fail closed: when the pre-poll visibility revalidation failed, do not poll Discourse
     # at all — the stored public flags cannot be trusted until a refresh revalidates them.
     # `refresh_category_visibility` above retries on every iteration and clears the flag
-    # on success, so polling resumes automatically. Delivery of already-enqueued jobs
-    # continues below so the outbound side keeps draining.
-    # Revalidate immediately before the privileged admin-key post poll. Doing
-    # this before Matrix long-polling leaves a confidentiality window equal to
-    # the sync timeout plus command processing time.
+    # on success, so polling resumes automatically. Queued delivery is gated
+    # by a second refresh immediately before the drain below.
+    # Revalidate immediately before the privileged admin-key post poll.
     await refresh_category_visibility(context=context, settings=settings, poll_state=poll_state)
     processed = await poll_once(
         client=context.discourse_client,
@@ -217,7 +215,13 @@ async def run_iteration(
     if processed:
         logger.info("Processed %s Discourse events", processed)
 
-    delivered = await drain_delivery_jobs(context)
+    # Jobs can predate the snapshot used by this poll. Revalidate once more
+    # immediately before draining; each worker then checks that fresh stored
+    # category row immediately before its Matrix write.
+    visibility_current = await refresh_category_visibility(
+        context=context, settings=settings, poll_state=poll_state
+    )
+    delivered = await drain_delivery_jobs(context) if visibility_current else 0
     if delivered:
         logger.info("Delivered %s Matrix jobs", delivered)
     next_batch = getattr(sync_response, "next_batch", None)

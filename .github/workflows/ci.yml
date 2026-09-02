@@ -31,9 +31,10 @@ jobs:
           wheel = next(Path("dist").glob("*.whl"))
           with ZipFile(wheel) as archive:
               names = set(archive.namelist())
+          migration_dir = Path("src/dischat/storage/migrations")
           required = {
-              "dischat/storage/migrations/0001_initial.sql",
-              "dischat/storage/migrations/0009_discourse_poll_state.sql",
+              f"dischat/storage/migrations/{path.name}"
+              for path in migration_dir.glob("*.sql")
           }
           missing = required - names
           if missing:

@@ -1,6 +1,95 @@
+import asyncio
 from datetime import UTC, datetime, timedelta
 
 from dischat.storage.repositories import PairingRateLimitRepository
+
+
+async def test_concurrent_issuance_reservations_never_exceed_cap(pg_pool) -> None:
+    limits = PairingRateLimitRepository(pg_pool)
+    now = datetime.now(UTC)
+    maximum = 3
+
+    results = await asyncio.gather(
+        *[
+            limits.reserve_issuance(
+                mxid="@parallel:aosus.org",
+                discourse_username="target",
+                now=now,
+                window=timedelta(hours=1),
+                max_issuances=maximum,
+            )
+            for _ in range(maximum + 2)
+        ]
+    )
+
+    assert sum(retry_at is None for retry_at in results) == maximum
+    assert sum(retry_at is not None for retry_at in results) == 2
+
+
+async def test_atomic_reservation_respects_active_cooldown(pg_pool) -> None:
+    limits = PairingRateLimitRepository(pg_pool)
+    now = datetime.now(UTC)
+    cooldown_until = now + timedelta(minutes=15)
+    await limits.apply_cooldown(
+        mxid="@cooldown:aosus.org",
+        discourse_username=None,
+        cooldown_until=cooldown_until,
+        now=now,
+    )
+
+    retry_at = await limits.reserve_issuance(
+        mxid="@cooldown:aosus.org",
+        discourse_username="target",
+        now=now,
+        window=timedelta(hours=1),
+        max_issuances=3,
+    )
+
+    assert retry_at == cooldown_until
+
+
+async def test_reservation_prunes_stale_rate_limit_and_event_rows(pg_pool) -> None:
+    limits = PairingRateLimitRepository(pg_pool)
+    now = datetime.now(UTC)
+    window = timedelta(hours=1)
+    stale = now - window - timedelta(seconds=1)
+    async with pg_pool.acquire() as connection:
+        await connection.execute(
+            """
+            INSERT INTO pairing_rate_limits
+                (mxid, discourse_username, updated_at, window_started_at)
+            VALUES ('@stale:aosus.org', 'old-target', $1, $1)
+            """,
+            stale,
+        )
+        await connection.execute(
+            """
+            INSERT INTO pairing_issuance_events (mxid, discourse_username, issued_at)
+            VALUES ('@stale:aosus.org', 'old-target', $1)
+            """,
+            stale,
+        )
+
+    assert (
+        await limits.reserve_issuance(
+            mxid="@fresh:aosus.org",
+            discourse_username="target",
+            now=now,
+            window=window,
+            max_issuances=3,
+        )
+        is None
+    )
+
+    async with pg_pool.acquire() as connection:
+        stale_limits = await connection.fetchval(
+            "SELECT COUNT(*) FROM pairing_rate_limits WHERE mxid = '@stale:aosus.org'"
+        )
+        stale_events = await connection.fetchval(
+            "SELECT COUNT(*) FROM pairing_issuance_events WHERE mxid = '@stale:aosus.org'"
+        )
+    assert stale_limits == 0
+    assert stale_events == 0
 
 
 async def test_issuance_counter_persists_across_rows_and_rolls_window(pg_pool) -> None:

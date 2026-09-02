@@ -69,9 +69,12 @@ Discourse category listing **before every production poll** — not on a timer. 
 deliberately no cadence knob: any interval between the snapshot and the poll would be a
 window in which a stored `is_public=TRUE` flag is an unverified claim, so a category an
 admin just made read-restricted could keep being routed until the next scheduled
-refresh. Revalidating per poll closes that window entirely: a visibility change is
-picked up by the very next poll (bounded by `POLL_INTERVAL_SECONDS`, which also paces
-the category listing call), and a newly public category opens up just as fast.
+refresh. Revalidating per poll prevents a stale snapshot from being reused across poll
+iterations: a visibility change is picked up by the next poll (bounded by
+`POLL_INTERVAL_SECONDS`, which also paces the category listing call), and a newly public
+category opens up just as fast. Discourse does not expose an atomic "visibility plus
+post" read, so an unavoidable distributed race remains between a successful category
+read and the immediately following post read.
 
 Because the visibility revalidation is the only thing that keeps the stored
 `is_public`/`enabled` flags honest — and because the Discourse client's admin API key
@@ -82,9 +85,9 @@ revalidation must never leave the last-known snapshot in charge:
   **polling is suspended entirely** until a refresh succeeds. `run_iteration` passes the
   stale flag into `poll_once`, which skips the whole Discourse poll (nothing is read, no
   events are created, no delivery jobs are enqueued, and `last_seen_post_id` does not
-  advance). This closes both the `public -> private` + refresh-outage window and the
-  quieter `public -> private` between two successful refreshes: no poll ever runs
-  against an unverified snapshot.
+  advance). This closes the `public -> private` + refresh-outage window and prevents a
+  snapshot from surviving between iterations: no poll runs against a snapshot that was
+  not refreshed during that same iteration.
 - While stale, the revalidation is retried on **every** iteration, so the outage window
   is as short as the category listing allows. A successful refresh revalidates the
   snapshot and clears the flag.
@@ -93,9 +96,10 @@ revalidation must never leave the last-known snapshot in charge:
 - Once a fresh snapshot proves a post belongs to a private/disabled category,
   the durable scan cursor advances past it. Content observed as private is
   never retroactively delivered merely because the category later becomes
-  public. Matrix sync/commands and delivery of already-enqueued jobs are
-  unaffected by a visibility-refresh suspension. The live-E2E test category
-  is exempt, since it never consults the visibility snapshot.
+  public. Matrix sync/commands remain available during a refresh suspension,
+  while already-enqueued production jobs are paused until a fresh pre-drain
+  visibility check succeeds. The live-E2E test category is exempt, since it
+  never consults the visibility snapshot.
 
 Deployment secrets hygiene:
 

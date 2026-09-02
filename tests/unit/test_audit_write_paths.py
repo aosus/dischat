@@ -743,7 +743,18 @@ async def test_attempt_row_is_pending_before_external_write() -> None:
             raise RuntimeError("delivery mapping insert failed")
 
     audit = SpyingAuditLogs()
-    matrix = StubWorkerMatrix()
+
+    class BoundaryMatrix(StubWorkerMatrix):
+        async def send_text(self, room_id: str, body: str, *, formatted=None):
+            assert len(audit.attempt_entries) == 1
+            pending = audit.attempt_entries[0]
+            assert pending.action == ACTION_ROOM_DELIVERY
+            assert pending.status == "pending"
+            assert pending.success is None
+            assert pending.matrix_event_id is None
+            return await super().send_text(room_id, body, formatted=formatted)
+
+    matrix = BoundaryMatrix()
     result = await deliver_job(
         job=make_delivery_job("room"),
         discourse_events=StubEventsRepo(ROOM_EVENT),

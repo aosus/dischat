@@ -46,6 +46,7 @@ async def pg_pool(database_url: str) -> AsyncIterator[asyncpg.Pool]:
             "room_links",
             "user_watches",
             "categories",
+            "pairing_issuance_events",
             "pairing_rate_limits",
             "pairing_sessions",
             "chat_accounts",

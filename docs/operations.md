@@ -20,7 +20,7 @@ current latest page instead of replaying the forum's entire history.
 
 Delivery jobs move through the following states:
 
-```
+```text
 pending ──claim──> running ──success──> complete
    ▲                  │
    │                  ├──handled error──> failed ──(backoff)──> claim again

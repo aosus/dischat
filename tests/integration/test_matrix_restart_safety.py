@@ -18,7 +18,12 @@ import pytest
 from dischat.bridge import handle_matrix_reply
 from dischat.discourse.sync import PollerState
 from dischat.main import run_iteration
-from dischat.matrix.client import MatrixMessage, MatrixSendResult, NioMatrixClient
+from dischat.matrix.client import (
+    MatrixMessage,
+    MatrixSendResult,
+    NioMatrixClient,
+    event_notice_tx_id,
+)
 from dischat.matrix.handler import process_sync_messages
 from dischat.security.audit import AuditEntry
 from dischat.service import DischatService, ServiceResponse
@@ -70,6 +75,7 @@ class FakeDiscourseWriteResult:
 class FakeNoticeMatrixClient:
     def __init__(self) -> None:
         self.notices: list[tuple[str, str]] = []
+        self.notice_calls: list[tuple[str, str, str | None]] = []
         self.notice_results_by_tx_id: dict[str, MatrixSendResult] = {}
         self.extract_messages_return: list[MatrixMessage] = []
         self.user_id = "@bridge:aosus.org"
@@ -77,6 +83,7 @@ class FakeNoticeMatrixClient:
     async def send_notice(
         self, room_id: str, body: str, *, tx_id: str | None = None
     ) -> MatrixSendResult:
+        self.notice_calls.append((room_id, body, tx_id))
         if tx_id is not None and tx_id in self.notice_results_by_tx_id:
             return self.notice_results_by_tx_id[tx_id]
         self.notices.append((room_id, body))
@@ -906,6 +913,11 @@ async def test_fenced_pair_command_sends_pm_exactly_once_across_crash(pg_pool) -
     # The PM was NOT sent again; the stored notice was delivered instead.
     assert len(discourse.pm_calls) == 1
     assert matrix.notices == [("!room:test", "code 123456 sent to alice_d")]
+    expected_tx_id = event_notice_tx_id("!room:test", "$cmd-1")
+    assert matrix.notice_calls == [
+        ("!room:test", "code 123456 sent to alice_d", expected_tx_id),
+        ("!room:test", "code 123456 sent to alice_d", expected_tx_id),
+    ]
     service.handle_message.assert_not_called()
     marker = await matrix_state.get_event(matrix_room_id="!room:test", matrix_event_id="$cmd-1")
     assert marker is not None and marker.status == "processed"
@@ -1028,6 +1040,11 @@ async def test_non_pm_command_notice_failure_keeps_fence_and_replay_never_reruns
     matrix.crash_on_notice = False
     await process_sync_messages(sync_response=sync_response, **call_kwargs)
     assert matrix.notices == [("!room:test", "account unpaired")]
+    expected_tx_id = event_notice_tx_id("!room:test", message.event_id)
+    assert matrix.notice_calls == [
+        ("!room:test", "account unpaired", expected_tx_id),
+        ("!room:test", "account unpaired", expected_tx_id),
+    ]
     service.handle_message.assert_not_called()
     marker = await matrix_state.get_event(
         matrix_room_id="!room:test", matrix_event_id=message.event_id

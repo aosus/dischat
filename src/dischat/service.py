@@ -69,7 +69,29 @@ class PairingSessionsRepo(Protocol):
 
 
 class PairingRateLimitsRepo(Protocol):
-    async def get_state(self, *, mxid: str, discourse_username: str | None): ...
+    async def get_state(
+        self, *, mxid: str, discourse_username: str | None
+    ) -> PairingRateLimitState | None: ...
+
+    async def reserve_issuance(
+        self,
+        *,
+        mxid: str,
+        discourse_username: str,
+        now: datetime,
+        window: timedelta,
+        max_issuances: int,
+    ) -> datetime | None: ...
+
+    async def record_failure_and_apply_cooldown(
+        self,
+        *,
+        mxid: str,
+        discourse_username: str,
+        now: datetime,
+        max_failures: int,
+        cooldown: timedelta,
+    ) -> datetime | None: ...
 
     async def record_issuance(
         self,
@@ -78,9 +100,11 @@ class PairingRateLimitsRepo(Protocol):
         discourse_username: str | None,
         now: datetime,
         window: timedelta,
-    ): ...
+    ) -> PairingRateLimitState: ...
 
-    async def record_failure(self, *, mxid: str, discourse_username: str | None, now: datetime): ...
+    async def record_failure(
+        self, *, mxid: str, discourse_username: str | None, now: datetime
+    ) -> PairingRateLimitState: ...
 
     async def apply_cooldown(
         self,
@@ -262,7 +286,6 @@ class DischatService:
         session = await self._pairing_sessions.get_active_session(mxid)
         if session is None:
             return None
-        state = None
         now = self._now()
         if session.consumed_at is not None or now >= session.expires_at:
             return ServiceResponse(body=translate("pairing.invalid_code", account.response_locale))
@@ -275,19 +298,6 @@ class DischatService:
                     "pairing.rate_limited",
                     account.response_locale,
                     minutes=str(max(1, remaining_seconds(retry_at, now=now) // 60)),
-                )
-            )
-        if self._pairing_rate_limits is not None:
-            state = await self._pairing_rate_limits.get_state(
-                mxid=mxid, discourse_username=session.discourse_username.lower()
-            )
-        decision = evaluate_verification(state, policy=self._rate_limit_policy(), now=now)
-        if not decision.allowed and decision.retry_at is not None:
-            return ServiceResponse(
-                body=translate_format(
-                    "pairing.rate_limited",
-                    account.response_locale,
-                    minutes=str(max(1, remaining_seconds(decision.retry_at, now=now) // 60)),
                 )
             )
         updated = await self._pairing_sessions.increment_attempt_count(session.id)
@@ -348,7 +358,7 @@ class DischatService:
                         minutes=str(max(1, remaining_seconds(retry_at, now=now) // 60)),
                     )
                 )
-            session, raw_code = self._pairing_service.start_session(account_mxid, args[0])
+            session, raw_code = self._pairing_service.start_session(account_mxid, args[0], now=now)
             if self._pairing_rate_limits is not None and atomic_reserve is None:
                 await self._pairing_rate_limits.record_issuance(
                     mxid=account_mxid,

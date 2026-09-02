@@ -7,7 +7,11 @@ WITH ranked AS (
 )
 UPDATE pairing_sessions
 SET consumed_at = NOW()
-WHERE id IN (SELECT id FROM ranked WHERE rn > 1);
+WHERE id IN (
+    SELECT id
+    FROM ranked
+    WHERE rn > 1
+);
 
 CREATE UNIQUE INDEX IF NOT EXISTS pairing_sessions_one_active_mxid_idx
 ON pairing_sessions (mxid) WHERE consumed_at IS NULL;
@@ -23,3 +27,9 @@ CREATE TABLE IF NOT EXISTS pairing_issuance_events (
 
 CREATE INDEX IF NOT EXISTS pairing_issuance_events_scope_time_idx
 ON pairing_issuance_events (mxid, discourse_username, issued_at);
+
+CREATE INDEX IF NOT EXISTS pairing_issuance_events_time_idx
+ON pairing_issuance_events (issued_at);
+
+CREATE INDEX IF NOT EXISTS pairing_rate_limits_updated_at_idx
+ON pairing_rate_limits (updated_at);

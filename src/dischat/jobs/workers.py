@@ -217,7 +217,9 @@ async def deliver_job(
     event_category_id = getattr(event, "category_id", None)
     if categories is not None and isinstance(event_category_id, int):
         category = await categories.get_by_discourse_category_id(event_category_id)
-        live_exception = live_e2e_category_id == 56 and event_category_id == 56
+        live_exception = (
+            live_e2e_category_id is not None and event_category_id == live_e2e_category_id
+        )
         if (
             category is None
             or not category.enabled

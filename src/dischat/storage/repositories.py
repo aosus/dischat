@@ -459,11 +459,36 @@ class PairingRateLimitRepository:
                 await connection.execute(
                     "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", mxid
                 )
+                # Opportunistic global retention: issuance is the only path
+                # that grows these tables, so pruning here bounds stale user
+                # identifiers without a separate scheduler.
                 await connection.execute(
-                    "DELETE FROM pairing_issuance_events WHERE mxid = $1 AND issued_at <= $2",
-                    mxid,
+                    "DELETE FROM pairing_issuance_events WHERE issued_at <= $1",
                     cutoff,
                 )
+                await connection.execute(
+                    """
+                    DELETE FROM pairing_rate_limits
+                    WHERE updated_at <= $1
+                      AND (cooldown_until IS NULL OR cooldown_until <= $2)
+                    """,
+                    cutoff,
+                    now,
+                )
+                cooldown_rows = await connection.fetch(
+                    """
+                    SELECT cooldown_until
+                    FROM pairing_rate_limits
+                    WHERE mxid = $1
+                      AND COALESCE(discourse_username, '') = ANY($2::text[])
+                      AND cooldown_until > $3
+                    """,
+                    mxid,
+                    ["", target],
+                    now,
+                )
+                if cooldown_rows:
+                    return max(row["cooldown_until"] for row in cooldown_rows)
                 rows = await connection.fetch(
                     """
                     SELECT discourse_username, COUNT(*) AS count, MIN(issued_at) AS oldest
@@ -474,8 +499,7 @@ class PairingRateLimitRepository:
                     mxid,
                     ["", target],
                 )
-                by_scope = {row["discourse_username"]: row for row in rows}
-                blocked = [row for row in by_scope.values() if row["count"] >= max_issuances]
+                blocked = [row for row in rows if row["count"] >= max_issuances]
                 if blocked:
                     return max(row["oldest"] + window for row in blocked)
                 await connection.executemany(
@@ -513,6 +537,10 @@ class PairingRateLimitRepository:
                                 WHEN pairing_rate_limits.cooldown_until IS NOT NULL
                                  AND pairing_rate_limits.cooldown_until <= $3 THEN 1
                                 ELSE pairing_rate_limits.failure_count + 1 END,
+                            cooldown_until = CASE
+                                WHEN pairing_rate_limits.cooldown_until IS NOT NULL
+                                 AND pairing_rate_limits.cooldown_until <= $3 THEN NULL
+                                ELSE pairing_rate_limits.cooldown_until END,
                             updated_at = $3
                         RETURNING failure_count, cooldown_until
                         """,

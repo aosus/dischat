@@ -185,6 +185,7 @@ class FakeRoomLinks:
     def __init__(self, room_link: RoomLinkRecord | None = None) -> None:
         self.room_link = room_link
         self.by_category: dict[str, list[RoomLinkRecord]] = {}
+        self.all_public: list[RoomLinkRecord] = []
         self.by_room: dict[str, RoomLinkRecord] = {}
         self.matching_calls: list[dict[str, object]] = []
         if room_link is not None:
@@ -203,7 +204,10 @@ class FakeRoomLinks:
         self.matching_calls.append(
             {"category_slug": category_slug, "include_non_public": include_non_public}
         )
-        return self.by_category.get(category_slug, [])
+        matches = list(self.by_category.get(category_slug, []))
+        if not include_non_public:
+            matches.extend(self.all_public)
+        return matches
 
 
 class FakeDeliveryMessages:
@@ -307,6 +311,7 @@ class FakeAuditLogs:
 class FakeUserWatches:
     def __init__(self) -> None:
         self.mxids_by_category: dict[int, list[str]] = {}
+        self.all_public: list[str] = []
         self.watch_calls: list[dict[str, object]] = []
 
     async def list_mxids_for_category(
@@ -315,7 +320,10 @@ class FakeUserWatches:
         self.watch_calls.append(
             {"category_id": category_id, "include_non_public": include_non_public}
         )
-        return self.mxids_by_category.get(category_id, [])
+        matches = list(self.mxids_by_category.get(category_id, []))
+        if not include_non_public:
+            matches.extend(self.all_public)
+        return matches
 
 
 class FakeDeliveryJobs:
@@ -1129,10 +1137,10 @@ async def test_live_e2e_bypass_never_fans_private_category_out_to_all_public_wat
         enabled=True,
         category_slugs=(),
     )
-    room_links.by_category["all"] = [all_public_room]
+    room_links.all_public = [all_public_room]
     # And no explicit category watch — only an all_public_categories watch.
     watches = FakeUserWatches()
-    watches.mxids_by_category[999] = ["@all:aosus.org"]
+    watches.all_public = ["@all:aosus.org"]
 
     discourse_events = FakeDiscourseEvents()
     jobs = FakeDeliveryJobs()

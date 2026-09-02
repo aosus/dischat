@@ -3,6 +3,9 @@
 The repository includes a production `Dockerfile`, a standard `docker-compose.yml`, and a live-test `docker-compose.live-e2e.yml`.
 
 Use `docker compose up --build -d` for local service startup. The container runs the long-lived bridge process rather than a one-shot bootstrap command.
+Compose requires a regular-file `config.yaml` next to `docker-compose.yml`; copy
+`config.example.yaml` before the first startup. The bind mount deliberately
+refuses to create a directory when that file is missing.
 
 The regular test suite also uses Docker for PostgreSQL integration tests through Testcontainers.
 
@@ -63,9 +66,12 @@ explicitly excludes `.env*` and runtime `config*.yaml` files so credentials
 and room mappings cannot enter image layers; Compose mounts `config.yaml`
 read-only at runtime.
 
-Rotating a password later requires `ALTER ROLE ... WITH PASSWORD` plus the
-matching `.env` update, since initialization variables apply only to a new
-data volume.
+The one-shot `db-bootstrap` service verifies the role split and applies the
+runtime-role password on every startup, including existing volumes. For a
+volume created by the older single-role Compose setup, set
+`POSTGRES_LEGACY_PASSWORD` to that role's previous password for the first
+upgraded startup if it differs from the new `POSTGRES_PASSWORD`; remove it
+after `db-bootstrap` succeeds.
 
 The application image includes a heartbeat healthcheck. A stale heartbeat
 marks the container unhealthy after five minutes; monitor that status in

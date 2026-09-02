@@ -14,14 +14,14 @@ def test_uses_class_name_when_message_is_empty() -> None:
     assert failure_reason(RuntimeError()) == "RuntimeError"
 
 
-def test_redacts_api_key_assignment() -> None:
+def test_excludes_api_key_message_text() -> None:
     exc = RuntimeError("Discourse rejected Api-Key=super-secret-key request")
     reason = failure_reason(exc)
     assert "super-secret-key" not in reason
     assert reason == "RuntimeError"
 
 
-def test_redacts_token_password_and_secret_assignments() -> None:
+def test_excludes_token_password_and_secret_message_text() -> None:
     for secret in (
         "access_token: abc123",
         "password=hunter2",
@@ -36,19 +36,19 @@ def test_redacts_token_password_and_secret_assignments() -> None:
         assert reason == "RuntimeError"
 
 
-def test_redacts_bearer_tokens() -> None:
+def test_excludes_bearer_token_message_text() -> None:
     reason = failure_reason(RuntimeError("auth failed: Bearer eyJhbGciOiTokenValue"))
     assert "eyJhbGciOiTokenValue" not in reason
     assert reason == "RuntimeError"
 
 
-def test_redacts_pairing_codes() -> None:
+def test_excludes_pairing_code_message_text() -> None:
     reason = failure_reason(RuntimeError("pairing code 123456 rejected for target_user"))
     assert "123456" not in reason
     assert reason == "RuntimeError"
 
 
-def test_redacts_url_path_and_query_but_keeps_host() -> None:
+def test_excludes_url_message_text() -> None:
     reason = failure_reason(
         RuntimeError("connect failed for https://aosus.org/posts.json?api_key=k123")
     )
@@ -58,14 +58,14 @@ def test_redacts_url_path_and_query_but_keeps_host() -> None:
     assert "k123" not in reason
 
 
-def test_redacts_urls_with_embedded_credentials() -> None:
+def test_excludes_url_credentials_and_host_message_text() -> None:
     reason = failure_reason(RuntimeError("cannot reach https://user:pass@matrix.aosus.org/_matrix"))
     assert "user:pass" not in reason
     assert "matrix.aosus.org" not in reason
     assert reason == "RuntimeError"
 
 
-def test_flattens_newlines_to_single_line() -> None:
+def test_excludes_multiline_message_text() -> None:
     reason = failure_reason(RuntimeError("line one\nline two\nline three"))
     assert "\n" not in reason
     assert reason == "RuntimeError"
@@ -76,9 +76,8 @@ def test_truncates_to_200_characters() -> None:
     assert len(reason) <= 200
 
 
-def test_truncation_applies_after_redaction() -> None:
-    # The secret sits beyond the 200th character: redaction must still remove
-    # it before truncation so it cannot be re-exposed by the cut.
+def test_long_secret_message_text_is_excluded() -> None:
+    # Even long exception messages are excluded wholesale.
     exc = RuntimeError("prefix " + "y" * 190 + " token=leaky-secret-value")
     reason = failure_reason(exc)
     assert "leaky-secret-value" not in reason

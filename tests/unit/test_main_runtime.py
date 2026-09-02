@@ -274,9 +274,15 @@ async def test_run_iteration_syncs_processes_and_returns_next_batch(monkeypatch)
         drain_calls.append(context)
         return 3
 
+    async def fake_refresh_category_visibility(**kwargs) -> bool:
+        return True
+
     monkeypatch.setattr("dischat.main.process_sync_messages", fake_process_sync_messages)
     monkeypatch.setattr("dischat.main.poll_once", fake_poll_once)
     monkeypatch.setattr("dischat.main.drain_delivery_jobs", fake_drain_delivery_jobs)
+    monkeypatch.setattr(
+        "dischat.main.refresh_category_visibility", fake_refresh_category_visibility
+    )
 
     context = SimpleNamespace(
         matrix_client=FakeMatrixClient(),
@@ -538,7 +544,7 @@ async def test_run_iteration_revalidates_visibility_before_every_poll(monkeypatc
         sync_since=None,
     )
     first_count = discourse.list_categories_calls
-    assert first_count == 1
+    assert first_count == 2
 
     await run_iteration(
         context=context,
@@ -549,7 +555,7 @@ async def test_run_iteration_revalidates_visibility_before_every_poll(monkeypatc
 
     # No cadence: every production poll is preceded by a fresh visibility revalidation,
     # so a `public -> private` transition can never be missed between refreshes.
-    assert discourse.list_categories_calls == first_count + 1
+    assert discourse.list_categories_calls == first_count + 2
 
 
 async def test_refresh_failure_keeps_last_known_snapshot_and_fails_closed(monkeypatch) -> None:
@@ -1000,7 +1006,7 @@ async def test_public_to_private_between_successful_refreshes_delivers_nothing(m
     assert len(delivery_jobs.enqueued) == 1
     assert delivery_jobs.completed and not delivery_jobs.failed
     refreshes_after_public = discourse.list_categories_calls
-    assert refreshes_after_public == 1
+    assert refreshes_after_public == 2
 
     # --- t1: admin makes category 10 read-restricted. The category listing keeps working
     # (no outage — every refresh below SUCCEEDS), but the admin-authenticated post feed
@@ -1022,7 +1028,7 @@ async def test_public_to_private_between_successful_refreshes_delivers_nothing(m
         sync_since="batch-2",
     )
     assert poll_state.visibility_stale is False  # refresh succeeded; not an outage path
-    assert discourse.list_categories_calls == refreshes_after_public + 1  # revalidated
+    assert discourse.list_categories_calls == refreshes_after_public + 2  # revalidated
     assert categories.by_discourse_id[10].is_public is False  # stored flag flipped
     # No event, no enqueue, no delivery for the private post.
     assert len(context.discourse_events.created) == events_before

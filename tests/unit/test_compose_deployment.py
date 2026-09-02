@@ -48,6 +48,9 @@ def test_postgres_has_healthcheck() -> None:
 def test_services_restart_policy_is_unless_stopped() -> None:
     services = _load_compose()["services"]
     for name, service in services.items():
+        if name == "db-bootstrap":
+            assert service.get("restart") == "no"
+            continue
         assert service.get("restart") == "unless-stopped", (
             f"{name} must use restart: unless-stopped"
         )
@@ -68,9 +71,24 @@ def test_postgres_runtime_role_is_not_the_bootstrap_superuser() -> None:
     assert compose["services"]["dischat"]["environment"]["POSTGRES_ADMIN_PASSWORD"] == ""
 
 
+def test_existing_volume_role_upgrade_runs_before_application() -> None:
+    compose = _load_compose()
+    bootstrap = compose["services"]["db-bootstrap"]
+    assert bootstrap["depends_on"]["postgres"]["condition"] == "service_healthy"
+    assert compose["services"]["dischat"]["depends_on"]["db-bootstrap"]["condition"] == (
+        "service_completed_successfully"
+    )
+    script = (REPO_ROOT / "docker/postgres/ensure-runtime-user.sh").read_text(encoding="utf-8")
+    assert "legacy dischat owner" in script
+    assert "NOSUPERUSER" in script
+
+
 def test_runtime_config_is_mounted_instead_of_baked_into_image() -> None:
     mounts = _load_compose()["services"]["dischat"]["volumes"]
-    assert "./config.yaml:/app/config.yaml:ro" in mounts
+    config_mount = next(mount for mount in mounts if mount.get("target") == "/app/config.yaml")
+    assert config_mount["source"] == "./config.yaml"
+    assert config_mount["read_only"] is True
+    assert config_mount["bind"]["create_host_path"] is False
 
     dockerignore = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
     assert ".env" in dockerignore

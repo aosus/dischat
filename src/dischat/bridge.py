@@ -266,7 +266,7 @@ def relay_username_for_platform(*, platform: str, matrix: str, telegram: str, di
 async def _send_notice_with_audit(
     *,
     matrix_client: MatrixNoticeClient,
-    audit_logs: Any,
+    audit_logs: AuditLogsRepo,
     room_id: str,
     body: str,
     mxid: str,
@@ -540,7 +540,7 @@ async def handle_matrix_reply(
     )
     if event_state is not None and lease_owner is not None:
         begin_write = getattr(event_state, "begin_event_write", None)
-        if begin_write is not None and not await begin_write(
+        if begin_write is None or not await begin_write(
             matrix_room_id=message.room_id,
             matrix_event_id=message.event_id,
             lease_owner=lease_owner,

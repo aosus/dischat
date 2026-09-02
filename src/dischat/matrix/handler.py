@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
-from dischat.bridge import handle_matrix_reply
+from dischat.bridge import MatrixEventStateRepo, MatrixNoticeClient, handle_matrix_reply
 from dischat.commands.parser import parse_command
 from dischat.matrix.client import MatrixMessage, MatrixSendResult, event_notice_tx_id
 from dischat.security.audit import (
@@ -22,9 +22,9 @@ from dischat.storage.repositories import new_lease_owner
 
 async def _deliver_fenced_command(
     *,
-    matrix_client: Any,
-    discourse_client,
-    event_state,
+    matrix_client: MatrixNoticeClient,
+    discourse_client: PairingPmWriter,
+    event_state: MatrixEventStateRepo | None,
     audit_logs: AuditLogsRepo | None,
     sender_mxid: str,
     sender_platform: str,
@@ -137,7 +137,7 @@ async def _deliver_fenced_command(
 
     try:
         begin_write = getattr(event_state, "begin_event_write", None)
-        if begin_write is not None and not await begin_write(
+        if begin_write is None or not await begin_write(
             matrix_room_id=room_id,
             matrix_event_id=event_id,
             lease_owner=lease_owner,
@@ -249,12 +249,12 @@ async def process_sync_messages(
     *,
     matrix_client: Any,
     service: CommandService,
-    discourse_client,
-    chat_accounts,
-    room_links,
-    delivery_messages,
+    discourse_client: Any,
+    chat_accounts: Any,
+    room_links: Any,
+    delivery_messages: Any,
     audit_logs: AuditLogsRepo | None = None,
-    event_state=None,
+    event_state: MatrixEventStateRepo | None = None,
     relay_matrix_username: str,
     relay_telegram_username: str,
     relay_discord_username: str,
